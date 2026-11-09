@@ -1,0 +1,178 @@
+name: Build patched Curbox
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Curbox release to patch (6 or later), or "latest"'
+        required: true
+        default: latest
+      force:
+        description: Rebuild even if this release was already built
+        type: boolean
+        default: false
+  schedule:
+    # Daily check for a new upstream release (09:00 UTC). Builds only when there is one.
+    - cron: '0 9 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-patched-curbox
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: curbox-app/curbox-android
+  MIN_RELEASE: 6
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Resolve release
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_RELEASE: ${{ github.event.inputs.release || 'latest' }}
+          INPUT_FORCE: ${{ github.event.inputs.force || 'false' }}
+        run: |
+          set -euo pipefail
+          LATEST="$(gh release view -R "$UPSTREAM" --json tagName -q .tagName)"
+          if [ "$INPUT_RELEASE" = "latest" ]; then
+            TAG="$LATEST"
+          else
+            TAG="$INPUT_RELEASE"
+          fi
+
+          if ! [[ "$TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::'$TAG' is not a valid release name."
+            exit 1
+          fi
+          if [[ "$TAG" =~ ^[0-9]+$ ]] && [ "$TAG" -lt "$MIN_RELEASE" ]; then
+            echo "::error::The patch supports Curbox $MIN_RELEASE and later (asked for $TAG)."
+            exit 1
+          fi
+          if ! gh release view "$TAG" -R "$UPSTREAM" > /dev/null 2>&1; then
+            echo "::error::Curbox has no release '$TAG'. See https://github.com/$UPSTREAM/releases"
+            exit 1
+          fi
+
+          OUT="${TAG}-grayscale"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "out=$OUT" >> "$GITHUB_OUTPUT"
+          # Only the newest upstream release becomes "latest" here, so update apps never downgrade.
+          if [ "$TAG" = "$LATEST" ]; then echo "latest=true" >> "$GITHUB_OUTPUT"; else echo "latest=false" >> "$GITHUB_OUTPUT"; fi
+
+          if gh release view "$OUT" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 && [ "$INPUT_FORCE" != "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Release **$OUT** already exists. Nothing to do (run with *force* to rebuild)." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Clone Curbox ${{ steps.rel.outputs.tag }}
+        if: steps.rel.outputs.skip == 'false'
+        env:
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: |
+          # Full history so `git am -3` can find the blobs the patch was made against.
+          git clone --quiet "https://github.com/$UPSTREAM.git" curbox
+          git -C curbox checkout --quiet "refs/tags/$TAG"
+
+      - name: Apply grayscale patch
+        if: steps.rel.outputs.skip == 'false'
+        working-directory: curbox
+        env:
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: |
+          git config user.name "curbox-patcher builder"
+          git config user.email "actions@users.noreply.github.com"
+          if ! git am -3 ../patches/grayscale.patch; then
+            {
+              echo "### The patch no longer applies to Curbox $TAG"
+              echo "Conflicting files:"
+              git diff --name-only --diff-filter=U | sed 's/^/- /'
+              echo ""
+              echo "Fix: run \`scripts/refresh-patch.sh\` locally (see README), push, then run this workflow again."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Patch conflicts with Curbox $TAG. See the job summary."
+            exit 1
+          fi
+
+      - name: Set up JDK 21
+        if: steps.rel.outputs.skip == 'false'
+        uses: actions/setup-java@v4.2.1
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Android SDK
+        if: steps.rel.outputs.skip == 'false'
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools build-tools;29.0.3'
+
+      # fdroid unit tests don't compile upstream (SupabaseRestTest needs sync classes), so the
+      # patch's tests run on the full flavor; the logic under test is flavor independent.
+      - name: Run grayscale tests
+        if: steps.rel.outputs.skip == 'false'
+        working-directory: curbox
+        run: |
+          chmod +x gradlew
+          ./gradlew testFullDebugUnitTest --tests "*GrayscaleOwnership*"
+
+      - name: Build fdroid release APK
+        if: steps.rel.outputs.skip == 'false'
+        working-directory: curbox
+        run: ./gradlew assembleFdroidRelease
+
+      - name: Sign APK
+        if: steps.rel.outputs.skip == 'false'
+        uses: r0adkll/sign-android-release@v1
+        id: sign
+        with:
+          releaseDirectory: curbox/app/build/outputs/apk/fdroid/release
+          signingKeyBase64: ${{ secrets.SIGNING_KEY }}
+          alias: ${{ secrets.ALIAS }}
+          keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+
+      - name: Prepare release
+        if: steps.rel.outputs.skip == 'false'
+        id: apk
+        env:
+          TAG: ${{ steps.rel.outputs.tag }}
+          OUT: ${{ steps.rel.outputs.out }}
+          SIGNED: ${{ steps.sign.outputs.signedReleaseFile }}
+        run: |
+          DEST="curbox-${OUT}-fdroid.apk"
+          cp "$SIGNED" "$DEST"
+          echo "path=$DEST" >> "$GITHUB_OUTPUT"
+
+          VERSION_CODE="$(grep -m1 -E '^[[:space:]]*versionCode[[:space:]]*=' curbox/app/build.gradle.kts | tr -dc '0-9')"
+          CHANGELOG="curbox/fastlane/metadata/android/en-US/changelogs/${VERSION_CODE}.txt"
+          {
+            echo "Curbox $TAG (fdroid) with the grayscale ownership patch."
+            echo ""
+            echo "Curbox only switches off a grayscale filter it switched on itself, so other apps"
+            echo "(e.g. GrayScaler+) keep control. Upstream: https://github.com/$UPSTREAM/releases/tag/$TAG"
+            echo ""
+            echo "---"
+            echo ""
+            if [ -s "$CHANGELOG" ]; then cat "$CHANGELOG"; fi
+          } > release-notes.md
+
+      - name: Publish release
+        if: steps.rel.outputs.skip == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.rel.outputs.out }}
+          name: Curbox ${{ steps.rel.outputs.out }}
+          body_path: release-notes.md
+          files: ${{ steps.apk.outputs.path }}
+          make_latest: ${{ steps.rel.outputs.latest }}

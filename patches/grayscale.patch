@@ -1,0 +1,431 @@
+From 744a73e9aa21e157eb869439795d3c663f38cea4 Mon Sep 17 00:00:00 2001
+From: fabt <46858378+fabiantorrestech@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 19:05:14 -0600
+Subject: [PATCH] fix(grayscale): never switch off a filter Curbox did not
+ switch on
+
+Curbox now tracks whether it owns the system grayscale filter and leaves
+filters from the user or other apps (e.g. GrayScaler+) alone:
+
+- Ownership is claimed only after the filter is seen on following
+  Curbox's own enable; a timed-out enable claims nothing.
+- If the filter goes off while Curbox owns it, someone else took over and
+  Curbox gives up ownership.
+- Commands are serialized so an async Shizuku "off" cannot overtake an
+  earlier "on".
+- Ownership is persisted in noBackupFilesDir so a restore cannot bring
+  back a stale value.
+
+GrayScaleFilter only routes its enable/disable calls through
+GrayscaleOwner, keeping the patch small on top of upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AeXNKkktrGXMGKErQQNrvR
+---
+ .../curbox/anti_stimulants/GrayScaleFilter.kt |   9 +-
+ .../curbox/anti_stimulants/GrayscaleOwner.kt  | 118 ++++++++++++++++
+ .../anti_stimulants/GrayscaleOwnership.kt     |  81 +++++++++++
+ .../anti_stimulants/GrayscaleOwnershipTest.kt | 128 ++++++++++++++++++
+ 4 files changed, 333 insertions(+), 3 deletions(-)
+ create mode 100644 app/src/main/java/neth/iecal/curbox/anti_stimulants/GrayscaleOwner.kt
+ create mode 100644 app/src/main/java/neth/iecal/curbox/anti_stimulants/GrayscaleOwnership.kt
+ create mode 100644 app/src/test/java/neth/iecal/curbox/anti_stimulants/GrayscaleOwnershipTest.kt
+
+diff --git a/app/src/main/java/neth/iecal/curbox/anti_stimulants/GrayScaleFilter.kt b/app/src/main/java/neth/iecal/curbox/anti_stimulants/GrayScaleFilter.kt
+index ad7d82b5..f739944e 100644
+--- a/app/src/main/java/neth/iecal/curbox/anti_stimulants/GrayScaleFilter.kt
++++ b/app/src/main/java/neth/iecal/curbox/anti_stimulants/GrayScaleFilter.kt
+@@ -34,6 +34,7 @@ class GrayScaleFilter : BaseBlocker() {
+ 
+     private lateinit var service: BaseBlockingService
+     private val grayscaleControl = GrayscaleControl()
++    private val grayscaleOwner = GrayscaleOwner(grayscaleControl)
+     private var ignoredGrayScalePackages: List<String> = listOf()
+     private var lastPackageName: String? = null
+     private var settingsJob: Job? = null
+@@ -69,7 +70,7 @@ class GrayScaleFilter : BaseBlocker() {
+         lastPackageName = currentPackageName
+ 
+         if (currentPackageName == service.packageName) {
+-            grayscaleControl.disableGrayscale(service)
++            grayscaleOwner.request(false)
+             return
+         }
+ 
+@@ -108,10 +109,10 @@ class GrayScaleFilter : BaseBlocker() {
+ 
+         if (shouldGrayscale) {
+             Log.d("GrayScaleFilter", "Enabling monochrome for $currentPackageName")
+-            grayscaleControl.enableGrayscale(service)
++            grayscaleOwner.request(true)
+         } else {
+             Log.d("GrayScaleFilter", "Disabling monochrome for $currentPackageName")
+-            grayscaleControl.disableGrayscale(service)
++            grayscaleOwner.request(false)
+         }
+     }
+ 
+@@ -127,6 +128,7 @@ class GrayScaleFilter : BaseBlocker() {
+ 
+     fun setup(service: BaseBlockingService) {
+         this.service = service
++        grayscaleOwner.attach(service)
+         destroyed = false
+         handler.removeCallbacks(scheduleChecker)
+         handler.postDelayed(scheduleChecker, 60_000L - System.currentTimeMillis() % 60_000L)
+@@ -178,6 +180,7 @@ class GrayScaleFilter : BaseBlocker() {
+         }
+         settingsJob?.cancel()
+         handler.removeCallbacksAndMessages(null)
++        grayscaleOwner.detach()
+     }
+ 
+     private val refreshReceiver = object : BroadcastReceiver() {
+diff --git a/app/src/main/java/neth/iecal/curbox/anti_stimulants/GrayscaleOwner.kt b/app/src/main/java/neth/iecal/curbox/anti_stimulants/GrayscaleOwner.kt
+new file mode 100644
+index 00000000..3556622b
+--- /dev/null
++++ b/app/src/main/java/neth/iecal/curbox/anti_stimulants/GrayscaleOwner.kt
+@@ -0,0 +1,118 @@
++package neth.iecal.curbox.anti_stimulants
++
++import android.content.Context
++import android.database.ContentObserver
++import android.os.Handler
++import android.os.Looper
++import android.provider.Settings
++import android.util.Log
++import neth.iecal.curbox.CrashLogger
++import neth.iecal.curbox.utils.GrayscaleControl
++import java.io.File
++
++/**
++ * Switches the system grayscale filter for [GrayScaleFilter] without touching a filter the user or
++ * another app switched on. Watches the system setting and applies [GrayscaleOwnership]'s rules.
++ * Everything runs on the main thread.
++ */
++class GrayscaleOwner(private val control: GrayscaleControl) {
++
++    companion object {
++        private const val TAG = "GrayscaleOwner"
++        private const val DALTONIZER_ENABLED = "accessibility_display_daltonizer_enabled"
++
++        // Kept in noBackupFilesDir so a backup restore can never bring back a stale "Curbox owns it".
++        private const val OWNED_FILE = "grayscale_owned_by_curbox"
++        private const val COMMAND_TIMEOUT_MS = 10_000L
++    }
++
++    private val handler = Handler(Looper.getMainLooper())
++    private var context: Context? = null
++    private var state: GrayscaleOwnership? = null
++
++    private val observer = object : ContentObserver(handler) {
++        override fun onChange(selfChange: Boolean) {
++            update { context, state -> state.observed(control.isGrayscaleEnabled(context)) }
++        }
++    }
++
++    private val timeout = Runnable {
++        update { context, state -> state.timedOut(control.isGrayscaleEnabled(context)) }
++    }
++
++    /** Safe to call again; GrayScaleFilter.setup() runs on every refresh. */
++    fun attach(context: Context) {
++        if (this.context != null) return
++        try {
++            this.context = context
++            state = GrayscaleOwnership(owned = readOwned(context))
++            context.contentResolver.registerContentObserver(
++                Settings.Secure.getUriFor(DALTONIZER_ENABLED), false, observer
++            )
++            // Drops ownership if the filter was switched off while the service was not running.
++            update { ctx, state -> state.observed(control.isGrayscaleEnabled(ctx)) }
++        } catch (e: Exception) {
++            Log.e(TAG, "Failed to attach", e)
++            CrashLogger(context).logNonFatalError(e)
++        }
++    }
++
++    fun detach() {
++        val context = this.context ?: return
++        handler.removeCallbacks(timeout)
++        try {
++            context.contentResolver.unregisterContentObserver(observer)
++        } catch (e: Exception) {
++            Log.e(TAG, "Failed to detach", e)
++        }
++        this.context = null
++        state = null
++    }
++
++    /** Curbox wants the filter on ([wants] = true) or off for the app in front. */
++    fun request(wants: Boolean) {
++        update { context, state -> state.request(wants, control.isGrayscaleEnabled(context)) }
++    }
++
++    private fun update(change: (Context, GrayscaleOwnership) -> GrayscaleOwnership.Command) {
++        val context = this.context ?: return
++        val state = this.state ?: return
++        try {
++            val ownedBefore = state.owned
++            val command = change(context, state)
++            if (state.owned != ownedBefore) writeOwned(context, state.owned)
++            if (state.pending == null) handler.removeCallbacks(timeout)
++
++            when (command) {
++                GrayscaleOwnership.Command.ENABLE -> {
++                    Log.d(TAG, "Enabling monochrome")
++                    control.enableGrayscale(context)
++                }
++                GrayscaleOwnership.Command.DISABLE -> {
++                    Log.d(TAG, "Disabling monochrome")
++                    control.disableGrayscale(context)
++                }
++                GrayscaleOwnership.Command.NONE -> return
++            }
++
++            handler.removeCallbacks(timeout)
++            handler.postDelayed(timeout, COMMAND_TIMEOUT_MS)
++            // The direct WRITE_SECURE_SETTINGS path lands immediately; Shizuku reports via the observer.
++            update { ctx, s -> s.observed(control.isGrayscaleEnabled(ctx)) }
++        } catch (e: Exception) {
++            Log.e(TAG, "Grayscale update failed", e)
++            CrashLogger(context).logNonFatalError(e)
++        }
++    }
++
++    private fun ownedFile(context: Context) = File(context.noBackupFilesDir, OWNED_FILE)
++
++    private fun readOwned(context: Context): Boolean {
++        val file = ownedFile(context)
++        return file.exists() && file.readText().trim() == "1"
++    }
++
++    private fun writeOwned(context: Context, owned: Boolean) {
++        ownedFile(context).writeText(if (owned) "1" else "0")
++    }
++}
+diff --git a/app/src/main/java/neth/iecal/curbox/anti_stimulants/GrayscaleOwnership.kt b/app/src/main/java/neth/iecal/curbox/anti_stimulants/GrayscaleOwnership.kt
+new file mode 100644
+index 00000000..d8946ba8
+--- /dev/null
++++ b/app/src/main/java/neth/iecal/curbox/anti_stimulants/GrayscaleOwnership.kt
+@@ -0,0 +1,81 @@
++package neth.iecal.curbox.anti_stimulants
++
++/**
++ * Decides when Curbox may switch the system grayscale filter, so it never fights a filter the
++ * user or another app (e.g. GrayScaler+) switched on.
++ *
++ * Rules:
++ * - Curbox only switches the filter on when it is off, and only owns it once it is seen on.
++ * - Curbox only switches the filter off when it owns it and it is still on.
++ * - One command at a time: Shizuku runs each command on its own thread, so a later "off" could
++ *   otherwise land before an earlier "on". Requests made while a command is pending are queued
++ *   (latest wins) and replayed once the command lands or times out.
++ * - If the filter goes off while Curbox owns it and nothing is pending, someone else switched it
++ *   off, so Curbox gives up ownership and will not touch a later "on".
++ *
++ * Pure logic with no Android dependencies; [GrayscaleOwner] feeds it what the system reports and
++ * executes the returned commands.
++ */
++internal class GrayscaleOwnership(owned: Boolean = false) {
++
++    enum class Command { ENABLE, DISABLE, NONE }
++
++    var owned: Boolean = owned
++        private set
++
++    /** Target state of the command in flight, or null when nothing is pending. */
++    var pending: Boolean? = null
++        private set
++
++    private var queued: Boolean? = null
++
++    /** Curbox wants the filter on ([wants] = true) or off for the app in front. */
++    fun request(wants: Boolean, systemOn: Boolean): Command {
++        if (pending != null) {
++            queued = wants
++            return Command.NONE
++        }
++        if (owned && !systemOn) owned = false
++
++        return when {
++            wants && !systemOn -> {
++                pending = true
++                Command.ENABLE
++            }
++            !wants && owned -> {
++                pending = false
++                Command.DISABLE
++            }
++            else -> Command.NONE
++        }
++    }
++
++    /** The system filter state changed, or was read right after a command was issued. */
++    fun observed(systemOn: Boolean): Command {
++        val target = pending
++        if (target == null) {
++            if (owned && !systemOn) owned = false
++            return Command.NONE
++        }
++        if (systemOn != target) return Command.NONE
++
++        owned = target
++        pending = null
++        return replayQueued(systemOn)
++    }
++
++    /** The pending command did not show up in time. */
++    fun timedOut(systemOn: Boolean): Command {
++        val target = pending ?: return Command.NONE
++        pending = null
++        // A failed enable leaves nothing of ours on; a failed disable leaves our filter on.
++        owned = if (target) false else systemOn
++        return replayQueued(systemOn)
++    }
++
++    private fun replayQueued(systemOn: Boolean): Command {
++        val next = queued ?: return Command.NONE
++        queued = null
++        return request(next, systemOn)
++    }
++}
+diff --git a/app/src/test/java/neth/iecal/curbox/anti_stimulants/GrayscaleOwnershipTest.kt b/app/src/test/java/neth/iecal/curbox/anti_stimulants/GrayscaleOwnershipTest.kt
+new file mode 100644
+index 00000000..89cd8b25
+--- /dev/null
++++ b/app/src/test/java/neth/iecal/curbox/anti_stimulants/GrayscaleOwnershipTest.kt
+@@ -0,0 +1,128 @@
++package neth.iecal.curbox.anti_stimulants
++
++import neth.iecal.curbox.anti_stimulants.GrayscaleOwnership.Command
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class GrayscaleOwnershipTest {
++
++    // Core guarantee: with no group asking for grayscale, Curbox never writes the setting.
++
++    @Test
++    fun notWantedNeverTouchesSomeoneElsesFilter() {
++        val ownership = GrayscaleOwnership()
++        assertEquals(Command.NONE, ownership.request(wants = false, systemOn = true))
++        assertEquals(Command.NONE, ownership.request(wants = false, systemOn = false))
++        assertFalse(ownership.owned)
++    }
++
++    @Test
++    fun wantedWhileSomeoneElsesFilterIsOnIsNotClaimed() {
++        val ownership = GrayscaleOwnership()
++        assertEquals(Command.NONE, ownership.request(wants = true, systemOn = true))
++        assertFalse(ownership.owned)
++        assertEquals(Command.NONE, ownership.request(wants = false, systemOn = true))
++    }
++
++    // Normal cycle
++
++    @Test
++    fun enableThenDisableOwnFilter() {
++        val ownership = GrayscaleOwnership()
++        assertEquals(Command.ENABLE, ownership.request(wants = true, systemOn = false))
++        assertFalse("not owned until seen on", ownership.owned)
++
++        assertEquals(Command.NONE, ownership.observed(systemOn = true))
++        assertTrue(ownership.owned)
++        assertNull(ownership.pending)
++
++        assertEquals(Command.DISABLE, ownership.request(wants = false, systemOn = true))
++        assertEquals(Command.NONE, ownership.observed(systemOn = false))
++        assertFalse(ownership.owned)
++    }
++
++    // Issue 1: an enable that never landed must not leave Curbox owning a later filter.
++
++    @Test
++    fun failedEnableDoesNotClaimOwnership() {
++        val ownership = GrayscaleOwnership()
++        ownership.request(wants = true, systemOn = false)
++        assertEquals(Command.NONE, ownership.timedOut(systemOn = false))
++        assertFalse(ownership.owned)
++
++        // GrayScaler+ switches the filter on later; leaving the app must not switch it off.
++        assertEquals(Command.NONE, ownership.request(wants = false, systemOn = true))
++    }
++
++    // Issue 2: someone else switched Curbox's filter off and later on again.
++
++    @Test
++    fun takeoverByAnotherAppDropsOwnership() {
++        val ownership = GrayscaleOwnership(owned = true)
++        assertEquals(Command.NONE, ownership.observed(systemOn = false))
++        assertFalse(ownership.owned)
++
++        assertEquals(Command.NONE, ownership.observed(systemOn = true))
++        assertEquals(Command.NONE, ownership.request(wants = false, systemOn = true))
++    }
++
++    @Test
++    fun ownershipDroppedOnRequestIfFilterWentOffUnseen() {
++        val ownership = GrayscaleOwnership(owned = true)
++        assertEquals(Command.NONE, ownership.request(wants = false, systemOn = false))
++        assertFalse(ownership.owned)
++    }
++
++    // Issue 3: Shizuku commands run on separate threads, so they are serialized here.
++
++    @Test
++    fun disableWaitsForPendingEnable() {
++        val ownership = GrayscaleOwnership()
++        assertEquals(Command.ENABLE, ownership.request(wants = true, systemOn = false))
++        assertEquals("queued, not sent", Command.NONE, ownership.request(wants = false, systemOn = false))
++
++        assertEquals(Command.DISABLE, ownership.observed(systemOn = true))
++        assertEquals(Command.NONE, ownership.observed(systemOn = false))
++        assertFalse(ownership.owned)
++        assertNull(ownership.pending)
++    }
++
++    @Test
++    fun latestQueuedRequestWins() {
++        val ownership = GrayscaleOwnership()
++        ownership.request(wants = true, systemOn = false)
++        ownership.request(wants = false, systemOn = false)
++        ownership.request(wants = true, systemOn = false)
++
++        assertEquals(Command.NONE, ownership.observed(systemOn = true))
++        assertTrue(ownership.owned)
++    }
++
++    @Test
++    fun queuedRequestReplaysAfterTimeout() {
++        val ownership = GrayscaleOwnership()
++        ownership.request(wants = true, systemOn = false)
++        ownership.request(wants = true, systemOn = false)
++        assertEquals("retries the enable", Command.ENABLE, ownership.timedOut(systemOn = false))
++    }
++
++    @Test
++    fun failedDisableKeepsOwnership() {
++        val ownership = GrayscaleOwnership(owned = true)
++        ownership.request(wants = false, systemOn = true)
++        ownership.timedOut(systemOn = true)
++        assertTrue(ownership.owned)
++    }
++
++    // Restart: persisted ownership is honored only while the filter is still on.
++
++    @Test
++    fun restoredOwnershipStillDisables() {
++        val ownership = GrayscaleOwnership(owned = true)
++        assertEquals(Command.NONE, ownership.observed(systemOn = true))
++        assertEquals(Command.DISABLE, ownership.request(wants = false, systemOn = true))
++    }
++}
+-- 
+2.54.0.windows.1
+
