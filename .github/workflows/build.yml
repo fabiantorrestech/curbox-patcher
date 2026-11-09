@@ -25,6 +25,8 @@ concurrency:
 env:
   UPSTREAM: curbox-app/curbox-android
   MIN_RELEASE: 6
+  HUB: fabiantorrestech/android-apps
+  HUB_KEY: PERSONAL
 
 jobs:
   build:
@@ -142,6 +144,23 @@ jobs:
           keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
           keyPassword: ${{ secrets.KEY_PASSWORD }}
 
+      # Refuse to publish an APK signed with anything but the PERSONAL key the app hub expects,
+      # so a wrong secret can never ship an APK that won't install over the last one.
+      - name: Check signing key
+        if: steps.rel.outputs.skip == 'false'
+        env:
+          SIGNED: ${{ steps.sign.outputs.signedReleaseFile }}
+        run: |
+          set -euo pipefail
+          expected="$(curl -fsSL "https://raw.githubusercontent.com/$HUB/main/apps.json" | jq -r ".keys.$HUB_KEY")"
+          apksigner="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)/apksigner"
+          actual="$("$apksigner" verify --print-certs "$SIGNED" | sed -n 's/.*certificate SHA-256 digest: \([0-9a-f]*\).*/\1/p' | head -1)"
+          if [ -z "$expected" ] || [ "$expected" = "null" ] || [ "$actual" != "$expected" ]; then
+            echo "::error::APK signer $actual does not match $HUB_KEY in $HUB/apps.json ($expected)."
+            exit 1
+          fi
+          echo "Signed with $HUB_KEY ($actual)"
+
       - name: Prepare release
         if: steps.rel.outputs.skip == 'false'
         id: apk
@@ -176,3 +195,28 @@ jobs:
           body_path: release-notes.md
           files: ${{ steps.apk.outputs.path }}
           make_latest: ${{ steps.rel.outputs.latest }}
+
+      # Same rolling-release step as the other apps' workflows (android-apps ADR 4 and 8).
+      # Only the newest upstream release goes to the hub, so its download never goes backwards.
+      - name: Publish to the app hub (fabiantorrestech/android-apps)
+        if: steps.rel.outputs.skip == 'false' && steps.rel.outputs.latest == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.APP_HUB_TOKEN }}
+          TAG: curbox
+          NAME: Curbox (grayscale patch)
+          SRC: ${{ steps.apk.outputs.path }}
+          OUT: ${{ steps.rel.outputs.out }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::APP_HUB_TOKEN missing: not publishing to the hub"
+            exit 0
+          fi
+          cp "$SRC" Curbox.apk
+          title="$NAME $OUT"
+          notes="Built by CI from ${GITHUB_REPOSITORY}@${GITHUB_SHA::7}: Curbox ${OUT%-grayscale} with the grayscale patch, on $(date -u '+%Y-%m-%d %H:%M') UTC."
+          if gh release view "$TAG" --repo "$HUB" > /dev/null 2>&1; then
+            gh release upload "$TAG" Curbox.apk --repo "$HUB" --clobber
+            gh release edit "$TAG" --repo "$HUB" --title "$title" --notes "$notes"
+          else
+            gh release create "$TAG" Curbox.apk --repo "$HUB" --target main --title "$title" --notes "$notes" --latest=false
+          fi
