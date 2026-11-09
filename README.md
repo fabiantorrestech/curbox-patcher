@@ -132,6 +132,28 @@ Android can't install an app over a copy signed with a different key, so this ha
 4. Restore the backup during onboarding.
 5. Re-grant accessibility and Shizuku.
 
+## Backups
+
+A Curbox backup is a plain settings file (`curbox-settings-backup`, format version 1). It holds no app signature or package check, and the patch doesn't change any settings. So a backup made in one app restores in the other, as long as both are the same Curbox version. Restoring is only offered during onboarding.
+
+| Backup made in → restored into | Works? |
+| --- | --- |
+| Official Curbox → patched build (same version) | ✅ |
+| Patched build → official Curbox (same version) | ✅ |
+| Patched build → patched build, or official → official | ✅ |
+| Older Curbox → newer Curbox, while both use backup format 1 | ✅ |
+| Into a Curbox whose backup format number differs | ❌ "Unsupported backup version" |
+| Into a build without the UI hider or grayscale (Play Store flavor) | ✅ but those parts are dropped |
+
+What a backup does **not** carry, in either app:
+
+| Item | In the backup? |
+| --- | --- |
+| Blocking groups, schedules, keywords, grayscale groups, focus mode and other settings | ✅ |
+| Usage history and statistics | ❌ |
+| Accessibility, Shizuku, device admin and other permissions (grant them again) | ❌ |
+| The patch's "Curbox owns the filter" flag (starts fresh, which is the safe default) | ❌ |
+
 ## Cost
 
 - GitHub Actions is free for public repositories.
