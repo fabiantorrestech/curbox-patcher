@@ -181,12 +181,14 @@ jobs:
           VERSION_CODE="$(grep -m1 -E '^[[:space:]]*versionCode[[:space:]]*=' curbox/app/build.gradle.kts | tr -dc '0-9')"
           CHANGELOG="curbox/fastlane/metadata/android/en-US/changelogs/${VERSION_CODE}.txt"
           {
-            echo "Curbox $TAG (fdroid) with two patches:"
+            echo "Curbox $TAG (fdroid) with three patches:"
             echo ""
             echo "- Grayscale: Curbox only switches off a grayscale filter it switched on itself, so other"
             echo "  apps (e.g. GrayScaler+) keep control."
             echo "- Firefox: a link opened in Firefox from another app is checked against keyword groups"
             echo "  right away, not only after the first tap on the page."
+            echo "- Unlock waits: after each app group unlock, the next one waits longer (1, 2, 3 minutes"
+            echo "  and so on), starting over at your day end. Optional emergency password."
             echo ""
             echo "Upstream: https://github.com/$UPSTREAM/releases/tag/$TAG"
             echo ""
@@ -222,7 +224,7 @@ jobs:
           fi
           cp "$SRC" Curbox.apk
           title="$NAME $OUT"
-          notes="Built by CI from ${GITHUB_REPOSITORY}@${GITHUB_SHA::7}: Curbox ${OUT%-grayscale} with the grayscale and Firefox patches, on $(date -u '+%Y-%m-%d %H:%M') UTC."
+          notes="Built by CI from ${GITHUB_REPOSITORY}@${GITHUB_SHA::7}: Curbox ${OUT%-grayscale} with the grayscale, Firefox and unlock waits patches, on $(date -u '+%Y-%m-%d %H:%M') UTC."
           if gh release view "$TAG" --repo "$HUB" > /dev/null 2>&1; then
             gh release upload "$TAG" Curbox.apk --repo "$HUB" --clobber
             gh release edit "$TAG" --repo "$HUB" --title "$title" --notes "$notes"

@@ -1,0 +1,1491 @@
+From 22b4160caba91324f4b6b014a49a2a6b5a9b611c Mon Sep 17 00:00:00 2001
+From: fab <faibiantorrestech@gmail.com>
+Date: Sat, 14 Nov 2026 02:17:34 -0600
+Subject: [PATCH] feat(app blocker): growing wait between unlocks and emergency
+ unlock
+
+App groups can now make you wait after each unlock before the next one:
+1, 2, 3 minutes and so on (first wait, step and longest wait per group).
+The wait starts when the unlock ends (for "on each open", when you leave
+the apps) and starts over at a per weekday "day end" time.
+
+An optional emergency password unlocks a group right away, skipping the
+wait, limits and challenges, a set number of times per day. It does not
+grow the wait.
+
+Gap state lives in the app blocker service process. The day end times
+and password are a new gated setting (UNLOCK_GAP), so weaker changes
+wait out the settings change delay.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AeXNKkBfqarSMLZWk676Bs
+---
+ .../neth/iecal/curbox/blockers/AppBlocker.kt  | 101 ++++++++-
+ .../neth/iecal/curbox/data/models/Settings.kt |   3 +-
+ .../data/models/SettingsChangeDelayConfig.kt  |   3 +-
+ .../curbox/data/models/UnlockGapConfig.kt     |  66 ++++++
+ .../curbox/data/models/WarningScreenConfig.kt |   5 +
+ .../curbox/ui/activity/FragmentActivity.kt    |   2 +
+ .../curbox/ui/activity/WarningActivity.kt     | 124 +++++++++-
+ .../main/reducers/ReducersFragment.kt         |   8 +
+ .../reducers/advanced/UnlockGapFragment.kt    | 214 ++++++++++++++++++
+ .../shared/WarningConfigFormController.kt     |  72 +++++-
+ .../java/neth/iecal/curbox/utils/DataStore.kt |   9 +
+ .../curbox/utils/RestrictionComparator.kt     |  24 +-
+ .../iecal/curbox/utils/SettingsBackupCodec.kt |   6 +
+ .../curbox/utils/SettingsChangeDelayUtils.kt  |   1 +
+ .../res/layout/dialog_warning_overlay.xml     |  20 ++
+ app/src/main/res/layout/fragment_reducers.xml |  63 ++++++
+ .../main/res/layout/fragment_unlock_gap.xml   | 174 ++++++++++++++
+ .../res/layout/fragment_warning_config.xml    | 100 ++++++++
+ app/src/main/res/values/strings.xml           |  34 +++
+ 19 files changed, 1023 insertions(+), 6 deletions(-)
+ create mode 100644 app/src/main/java/neth/iecal/curbox/data/models/UnlockGapConfig.kt
+ create mode 100644 app/src/main/java/neth/iecal/curbox/ui/fragments/main/reducers/advanced/UnlockGapFragment.kt
+ create mode 100644 app/src/main/res/layout/fragment_unlock_gap.xml
+
+diff --git a/app/src/main/java/neth/iecal/curbox/blockers/AppBlocker.kt b/app/src/main/java/neth/iecal/curbox/blockers/AppBlocker.kt
+index 9fd9ce99..33860d84 100644
+--- a/app/src/main/java/neth/iecal/curbox/blockers/AppBlocker.kt
++++ b/app/src/main/java/neth/iecal/curbox/blockers/AppBlocker.kt
+@@ -22,6 +22,8 @@ import neth.iecal.curbox.R
+ import neth.iecal.curbox.data.models.AppBlockerWarningScreenConfig
+ import neth.iecal.curbox.data.models.AppGroupConfig
+ import neth.iecal.curbox.data.models.AppUsageConfig
++import neth.iecal.curbox.data.models.UnlockGapConfig
++import neth.iecal.curbox.data.models.UnlockGapSchedule
+ import neth.iecal.curbox.data.models.upgradeLegacyAppGroupConfigs
+ import neth.iecal.curbox.services.BaseBlockingService
+ import neth.iecal.curbox.ui.activity.WarningActivity
+@@ -54,6 +56,13 @@ class AppBlocker : BaseBlocker() {
+         const val INTENT_ACTION_WARNING_SCREEN_VISIBILITY =
+             "neth.iecal.curbox.appblocker.warning_screen_visibility"
+         const val EXTRA_WARNING_SCREEN_VISIBLE = "warning_screen_visible"
++
++        /** Cooldown intent extra: the unlock came from the emergency password. */
++        const val EXTRA_EMERGENCY = "emergency"
++        /** Warning screen extras for the growing wait between unlocks. */
++        const val EXTRA_UNLOCK_GAP_ENDS_AT = "unlock_gap_ends_at"
++        const val EXTRA_NEXT_UNLOCK_GAP_MN = "next_unlock_gap_mn"
++        const val EXTRA_EMERGENCY_UNLOCKS_LEFT = "emergency_unlocks_left"
+         private const val TARGET_EVENTS_MASK = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+     }
+ 
+@@ -76,6 +85,9 @@ class AppBlocker : BaseBlocker() {
+     // Holds the warning config last shown per group, used for the cooldown intent's default duration.
+     private val appBlockerWarningScrnConfgs = ConcurrentHashMap<String, AppBlockerWarningScreenConfig>()
+ 
++    @Volatile
++    private var unlockGapConfig = UnlockGapConfig()
++
+     private lateinit var usageStats : UsageStatsHelper
+     private var lastPackage = ""
+     private lateinit var service: BaseBlockingService
+@@ -204,7 +216,10 @@ class AppBlocker : BaseBlocker() {
+             .map(AppGroupEntry::groupId)
+             .distinct()
+             .filter(cooldownGroupsList::containsKey)
+-            .forEach(::removeCooldownFrom)
++            .forEach { groupId ->
++                recordOnEachOpenUnlockEnd(groupId, System.currentTimeMillis())
++                removeCooldownFrom(groupId)
++            }
+     }
+ 
+     // THIS IS EXPORTED HERE INTENTIONALLY. THE APPBLOCKER SERVICE RUNS IN A DIFFERENT PROCESS THAN
+@@ -247,6 +262,7 @@ class AppBlocker : BaseBlocker() {
+         settingsJob = CoroutineScope(Dispatchers.IO).launch {
+             service.dataStoreManager.settings.collectLatest { settings ->
+                 Log.d("AppBlocker", "Settings updated, groups count: ${settings.blockedAppGroups.size}")
++                unlockGapConfig = settings.unlockGapConfig
+ 
+                 val newBlockedAppsList = ConcurrentHashMap<String, MutableList<AppGroupEntry>>()
+                 settings.blockedAppGroups.upgradeLegacyAppGroupConfigs().forEach { group ->
+@@ -312,11 +328,82 @@ class AppBlocker : BaseBlocker() {
+             currentTimeMillis + durationMillis
+         }
+ 
++        if (intent.getBooleanExtra(EXTRA_EMERGENCY, false)) {
++            if (emergencyUnlocksLeft(currentTimeMillis) <= 0) return
++            recordEmergencyUnlock(currentTimeMillis)
++        } else if (warningConfigFor(groupId)?.isUnlockGapEnabled == true) {
++            recordUnlock(groupId, currentTimeMillis, realTimeEndMillis)
++        }
++
+         putCooldownTo(groupId, realTimeEndMillis)
+         showNextCooldownNotification()
+         setUpForcedRefreshChecker("cooldown:$groupId", realTimeEndMillis, groupId)
+     }
+ 
++    /**
++     * The group's current warning settings. The service can be recreated while the warning
++     * screen is open, so the last shown config is only a fallback.
++     */
++    private fun warningConfigFor(groupId: String): AppBlockerWarningScreenConfig? =
++        blockedAppsList.values.asSequence()
++            .flatten()
++            .firstOrNull { it.groupId == groupId }
++            ?.warningConfig
++            ?: appBlockerWarningScrnConfgs[groupId]
++
++    /** Unlocks of this group since the last day end. Emergency unlocks are not counted. */
++    private fun unlockStreak(groupId: String, now: Long): Int {
++        val lastUnlockAt = prefs.getLong("gap_last_unlock_$groupId", 0L)
++        if (lastUnlockAt < UnlockGapSchedule.lastDayEndAtOrBefore(now, unlockGapConfig)) return 0
++        return prefs.getInt("gap_streak_$groupId", 0)
++    }
++
++    private fun recordUnlock(groupId: String, now: Long, unlockEndsAt: Long) {
++        val streak = unlockStreak(groupId, now) + 1
++        prefs.edit {
++            putInt("gap_streak_$groupId", streak)
++            putLong("gap_last_unlock_$groupId", now)
++            putLong("gap_unlock_end_$groupId", unlockEndsAt)
++        }
++    }
++
++    /** An on each open unlock is stored as ending in a day; it really ends when the user leaves. */
++    private fun recordOnEachOpenUnlockEnd(groupId: String, now: Long) {
++        if (prefs.getLong("gap_unlock_end_$groupId", 0L) > now) {
++            prefs.edit { putLong("gap_unlock_end_$groupId", now) }
++        }
++    }
++
++    /** When the next unlock of this group is allowed, or 0 when there is no wait. */
++    private fun unlockGapEndsAt(groupId: String, config: AppBlockerWarningScreenConfig, now: Long): Long {
++        if (!config.isUnlockGapEnabled) return 0L
++        val streak = unlockStreak(groupId, now)
++        if (streak == 0) return 0L
++        val unlockEnd = prefs.getLong("gap_unlock_end_$groupId", 0L)
++        val gapMillis = UnlockGapSchedule.gapMinutes(config, streak) * 60_000L
++        return if (unlockEnd > Long.MAX_VALUE - gapMillis) Long.MAX_VALUE else unlockEnd + gapMillis
++    }
++
++    private fun emergencyUnlockTimesSince(dayStart: Long): List<Long> =
++        prefs.getString("emergency_unlock_times", "").orEmpty()
++            .split(",")
++            .mapNotNull { it.toLongOrNull() }
++            .filter { it >= dayStart }
++
++    private fun emergencyUnlocksLeft(now: Long): Int {
++        val config = unlockGapConfig
++        if (config.emergencyPasswordHash.isEmpty()) return 0
++        val dayStart = UnlockGapSchedule.lastDayEndAtOrBefore(now, config)
++        val used = emergencyUnlockTimesSince(dayStart).size
++        return (config.emergencyUnlocksPerDay - used).coerceAtLeast(0)
++    }
++
++    private fun recordEmergencyUnlock(now: Long) {
++        val dayStart = UnlockGapSchedule.lastDayEndAtOrBefore(now, unlockGapConfig)
++        val times = emergencyUnlockTimesSince(dayStart) + now
++        prefs.edit { putString("emergency_unlock_times", times.joinToString(",")) }
++    }
++
+     private fun getUsageLimitForToday(config: AppUsageConfig): Long {
+         return if (config.isDailyUniform) {
+             config.uniformLimit
+@@ -444,6 +531,15 @@ class AppBlocker : BaseBlocker() {
+             if (warningConfig.isWarningDialogHidden) return
+             isWarningScreenVisible = true
+ 
++            val now = System.currentTimeMillis()
++            val unlockGapEndsAt = unlockGapEndsAt(groupId, warningConfig, now)
++            val nextUnlockGapMinutes = if (warningConfig.isUnlockGapEnabled) {
++                UnlockGapSchedule.gapMinutes(warningConfig, unlockStreak(groupId, now) + 1)
++            } else {
++                0L
++            }
++            val emergencyUnlocksLeft = emergencyUnlocksLeft(now)
++
+             handler.postDelayed({
+                 val dialogIntent = Intent(service, WarningActivity::class.java).apply {
+                     flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+@@ -454,6 +550,9 @@ class AppBlocker : BaseBlocker() {
+                         "warning_config",
+                         Gson().toJson(warningConfig)
+                     )
++                    putExtra(EXTRA_UNLOCK_GAP_ENDS_AT, unlockGapEndsAt)
++                    putExtra(EXTRA_NEXT_UNLOCK_GAP_MN, nextUnlockGapMinutes)
++                    putExtra(EXTRA_EMERGENCY_UNLOCKS_LEFT, emergencyUnlocksLeft)
+                 }
+                 service.startActivity(dialogIntent)
+             }, 100)
+diff --git a/app/src/main/java/neth/iecal/curbox/data/models/Settings.kt b/app/src/main/java/neth/iecal/curbox/data/models/Settings.kt
+index 1b1220fe..9e0b2b95 100644
+--- a/app/src/main/java/neth/iecal/curbox/data/models/Settings.kt
++++ b/app/src/main/java/neth/iecal/curbox/data/models/Settings.kt
+@@ -26,5 +26,6 @@ data class Settings(
+     val nextWebsiteRecheckTime: Long = 0L,
+     val serviceProtectionConfig: ServiceProtectionConfig = ServiceProtectionConfig(),
+     val antiUninstallConfig2: AntiUninstallConfig = AntiUninstallConfig(),
+-    val settingsChangeDelayConfig2: SettingsChangeDelayConfig = SettingsChangeDelayConfig()
++    val settingsChangeDelayConfig2: SettingsChangeDelayConfig = SettingsChangeDelayConfig(),
++    val unlockGapConfig: UnlockGapConfig = UnlockGapConfig()
+ )
+diff --git a/app/src/main/java/neth/iecal/curbox/data/models/SettingsChangeDelayConfig.kt b/app/src/main/java/neth/iecal/curbox/data/models/SettingsChangeDelayConfig.kt
+index 8c4c8e63..f5e59c40 100644
+--- a/app/src/main/java/neth/iecal/curbox/data/models/SettingsChangeDelayConfig.kt
++++ b/app/src/main/java/neth/iecal/curbox/data/models/SettingsChangeDelayConfig.kt
+@@ -16,7 +16,8 @@ enum class GatedSettingsField {
+     UI_HIDER,
+     APP_USAGE_TRACKING,
+     WEBSITE_USAGE_TRACKING,
+-    CHANGE_DELAY
++    CHANGE_DELAY,
++    UNLOCK_GAP
+ }
+ 
+ /**
+diff --git a/app/src/main/java/neth/iecal/curbox/data/models/UnlockGapConfig.kt b/app/src/main/java/neth/iecal/curbox/data/models/UnlockGapConfig.kt
+new file mode 100644
+index 00000000..d1c56c0b
+--- /dev/null
++++ b/app/src/main/java/neth/iecal/curbox/data/models/UnlockGapConfig.kt
+@@ -0,0 +1,66 @@
++package neth.iecal.curbox.data.models
++
++import java.util.Calendar
++
++/**
++ * Shared settings for the growing wait between app group unlocks.
++ * The gap sizes themselves live in each group's [AppBlockerWarningScreenConfig].
++ */
++data class UnlockGapConfig(
++    /**
++     * When each day ends, as minutes after the following midnight, Sunday first.
++     * 180 for Friday means Friday's streak ends on Saturday at 3:00.
++     */
++    val dayEndMinutes: List<Int> = List(7) { 0 },
++
++    /** SHA-256 hash of the emergency password. Empty means emergency unlock is off. */
++    val emergencyPasswordHash: String = "",
++
++    /** How many emergency unlocks are allowed between two day ends. */
++    val emergencyUnlocksPerDay: Int = 1
++) {
++    companion object {
++        const val MAX_DAY_END_MINUTES = 12 * 60 - 1
++        const val MAX_EMERGENCY_UNLOCKS_PER_DAY = 10
++    }
++}
++
++object UnlockGapSchedule {
++
++    /** The most recent day end at or before [now]. */
++    fun lastDayEndAtOrBefore(now: Long, config: UnlockGapConfig): Long {
++        var latest = Long.MIN_VALUE
++        // A day end falls on the morning after its weekday, so only the last two weekdays can own it
++        for (dayOffset in -2..-1) {
++            val dayEnd = startOfDay(now, dayOffset).apply {
++                val weekday = get(Calendar.DAY_OF_WEEK) - 1
++                add(Calendar.DAY_OF_YEAR, 1)
++                add(Calendar.MINUTE, dayEndMinutesFor(config, weekday))
++            }.timeInMillis
++            if (dayEnd <= now && dayEnd > latest) latest = dayEnd
++        }
++        return latest
++    }
++
++    /** Gap in minutes after the [unlockNumber]th unlock of the day, counting from 1. */
++    fun gapMinutes(config: AppBlockerWarningScreenConfig, unlockNumber: Int): Long {
++        if (unlockNumber <= 0) return 0L
++        val start = config.unlockGapStartMn.coerceAtLeast(0).toLong()
++        val step = config.unlockGapStepMn.coerceAtLeast(0).toLong()
++        val max = config.unlockGapMaxMn.coerceAtLeast(0).toLong()
++        return minOf(start + step * (unlockNumber - 1), max)
++    }
++
++    private fun dayEndMinutesFor(config: UnlockGapConfig, weekday: Int): Int =
++        config.dayEndMinutes.getOrElse(weekday) { 0 }.coerceIn(0, UnlockGapConfig.MAX_DAY_END_MINUTES)
++
++    private fun startOfDay(now: Long, dayOffset: Int): Calendar =
++        Calendar.getInstance().apply {
++            timeInMillis = now
++            add(Calendar.DAY_OF_YEAR, dayOffset)
++            set(Calendar.HOUR_OF_DAY, 0)
++            set(Calendar.MINUTE, 0)
++            set(Calendar.SECOND, 0)
++            set(Calendar.MILLISECOND, 0)
++        }
++}
+diff --git a/app/src/main/java/neth/iecal/curbox/data/models/WarningScreenConfig.kt b/app/src/main/java/neth/iecal/curbox/data/models/WarningScreenConfig.kt
+index d355a2aa..ff6d5fdc 100755
+--- a/app/src/main/java/neth/iecal/curbox/data/models/WarningScreenConfig.kt
++++ b/app/src/main/java/neth/iecal/curbox/data/models/WarningScreenConfig.kt
+@@ -36,6 +36,11 @@ data class AppBlockerWarningScreenConfig(
+     val focusGoalRequiredMinutes: Int = 60,
+     /** For app groups, grant access only for the current selected-app session. */
+     val isOnOpenConfig: Boolean = false,
++    /** For app groups, wait longer after each unlock before the next one. Resets at the day end. */
++    val isUnlockGapEnabled: Boolean = false,
++    val unlockGapStartMn: Int = 1,
++    val unlockGapStepMn: Int = 1,
++    val unlockGapMaxMn: Int = 30,
+ )
+ 
+ class WarningMessagesAdapter : TypeAdapter<List<String>>() {
+diff --git a/app/src/main/java/neth/iecal/curbox/ui/activity/FragmentActivity.kt b/app/src/main/java/neth/iecal/curbox/ui/activity/FragmentActivity.kt
+index c5754b1e..2257999e 100644
+--- a/app/src/main/java/neth/iecal/curbox/ui/activity/FragmentActivity.kt
++++ b/app/src/main/java/neth/iecal/curbox/ui/activity/FragmentActivity.kt
+@@ -107,6 +107,7 @@ class FragmentActivity : AppCompatActivity() {
+             AntiUninstallFragment.FRAGMENT_ID,
+             ServiceProtectionFragment.FRAGMENT_ID,
+             SettingsChangeDelayFragment.FRAGMENT_ID,
++            neth.iecal.curbox.ui.fragments.main.reducers.advanced.UnlockGapFragment.FRAGMENT_ID,
+             CreateKeywordGroupFragment.FRAGMENT_ID -> {
+                 // Hide bottom nav for these standalone fragments
+                 bottomNav.visibility = android.view.View.GONE
+@@ -132,6 +133,7 @@ class FragmentActivity : AppCompatActivity() {
+                     AntiUninstallFragment.FRAGMENT_ID -> AntiUninstallFragment()
+                     ServiceProtectionFragment.FRAGMENT_ID -> ServiceProtectionFragment()
+                     SettingsChangeDelayFragment.FRAGMENT_ID -> SettingsChangeDelayFragment()
++                    neth.iecal.curbox.ui.fragments.main.reducers.advanced.UnlockGapFragment.FRAGMENT_ID -> neth.iecal.curbox.ui.fragments.main.reducers.advanced.UnlockGapFragment()
+                     else -> AccessibilityGuide()
+                 }
+                 fragment.arguments = intent.extras
+diff --git a/app/src/main/java/neth/iecal/curbox/ui/activity/WarningActivity.kt b/app/src/main/java/neth/iecal/curbox/ui/activity/WarningActivity.kt
+index cef4e4f6..3b476799 100755
+--- a/app/src/main/java/neth/iecal/curbox/ui/activity/WarningActivity.kt
++++ b/app/src/main/java/neth/iecal/curbox/ui/activity/WarningActivity.kt
+@@ -19,6 +19,8 @@ import androidx.appcompat.app.AlertDialog
+ import androidx.appcompat.app.AppCompatActivity
+ import androidx.lifecycle.lifecycleScope
+ import com.google.android.material.dialog.MaterialAlertDialogBuilder
++import com.google.android.material.textfield.TextInputEditText
++import com.google.android.material.textfield.TextInputLayout
+ import com.google.gson.Gson
+ import com.journeyapps.barcodescanner.ScanContract
+ import com.journeyapps.barcodescanner.ScanOptions
+@@ -31,6 +33,7 @@ import neth.iecal.curbox.blockers.ReelBlocker
+ import neth.iecal.curbox.data.db.AppDatabase
+ import neth.iecal.curbox.data.models.AppBlockerWarningScreenConfig
+ import neth.iecal.curbox.databinding.DialogWarningOverlayBinding
++import neth.iecal.curbox.utils.AntiUninstallManager
+ import neth.iecal.curbox.utils.DataStoreManager
+ import neth.iecal.curbox.utils.FocusGoalProgress
+ import java.util.Calendar
+@@ -50,6 +53,7 @@ import neth.iecal.curbox.anti_stimulants.MindfulMessage
+ class WarningActivity : AppCompatActivity() {
+ 
+     private var proceedTimer: CountDownTimer? = null
++    private var unlockGapTimer: CountDownTimer? = null
+     private var dialog: AlertDialog? = null
+ 
+     private var vibrator: Vibrator? = null
+@@ -109,6 +113,9 @@ class WarningActivity : AppCompatActivity() {
+         )
+ 
+         val targetId = intent.getStringExtra("result_id") ?: ""
++        val unlockGapEndsAt = intent.getLongExtra(AppBlocker.EXTRA_UNLOCK_GAP_ENDS_AT, 0L)
++        val nextUnlockGapMinutes = intent.getLongExtra(AppBlocker.EXTRA_NEXT_UNLOCK_GAP_MN, 0L)
++        val emergencyUnlocksLeft = intent.getIntExtra(AppBlocker.EXTRA_EMERGENCY_UNLOCKS_LEFT, 0)
+         var isProceedLimitExceeded = false
+         var timeUntilNextProceedMn = 0L
+         var proceedsLeft = -1
+@@ -275,7 +282,37 @@ class WarningActivity : AppCompatActivity() {
+                         }
+                         binding.proceedSeconds.visibility = View.GONE
+                     }
+-                }.start()
++                }
++
++            val unlockGapRemaining = unlockGapEndsAt - System.currentTimeMillis()
++            if (unlockGapRemaining > 0) {
++                startUnlockGapCountdown(unlockGapRemaining)
++            } else {
++                proceedTimer?.start()
++            }
++            if (nextUnlockGapMinutes > 0) {
++                binding.unlockGapNext.visibility = View.VISIBLE
++                binding.unlockGapNext.text = resources.getQuantityString(
++                    R.plurals.warning_unlock_gap_next,
++                    nextUnlockGapMinutes.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
++                    nextUnlockGapMinutes
++                )
++            }
++        }
++
++        if (mode == Constants.WARNING_SCREEN_MODE_APP_BLOCKER &&
++            emergencyUnlocksLeft > 0 &&
++            targetId.isNotEmpty()
++        ) {
++            binding.btnEmergency.visibility = View.VISIBLE
++            binding.btnEmergency.text = resources.getQuantityString(
++                R.plurals.warning_emergency_unlock_button,
++                emergencyUnlocksLeft,
++                emergencyUnlocksLeft
++            )
++            binding.btnEmergency.setOnClickListener {
++                showEmergencyUnlockDialog(warningScreenConfig, targetId)
++            }
+         }
+ 
+         dialog = MaterialAlertDialogBuilder(this)
+@@ -447,6 +484,87 @@ class WarningActivity : AppCompatActivity() {
+         }
+     }
+ 
++    /** Hides Proceed until the wait after the last unlock is over, then starts the normal wait. */
++    private fun startUnlockGapCountdown(remainingMillis: Long) {
++        binding.btnProceed.visibility = View.GONE
++        binding.proceedSeconds.visibility = View.VISIBLE
++        unlockGapTimer = object : CountDownTimer(remainingMillis.coerceAtMost(MAX_UNLOCK_GAP_MS), 1000) {
++            override fun onTick(millisUntilFinished: Long) {
++                val totalSeconds = (millisUntilFinished + 999) / 1000
++                binding.proceedSeconds.text = getString(
++                    R.string.warning_unlock_gap_wait,
++                    totalSeconds / 60,
++                    totalSeconds % 60
++                )
++            }
++
++            override fun onFinish() {
++                binding.btnProceed.visibility = View.VISIBLE
++                proceedTimer?.start()
++            }
++        }.start()
++    }
++
++    private fun showEmergencyUnlockDialog(
++        warningScreenConfig: AppBlockerWarningScreenConfig,
++        groupId: String
++    ) {
++        val dialogView = layoutInflater.inflate(R.layout.dialog_anti_uninstall_password, null)
++        val passwordField = dialogView.findViewById<TextInputEditText>(R.id.input_password)
++        dialogView.findViewById<TextInputLayout>(R.id.input_layout_confirm).visibility = View.GONE
++
++        MaterialAlertDialogBuilder(this)
++            .setTitle(R.string.warning_emergency_unlock_title)
++            .setMessage(R.string.warning_emergency_unlock_message)
++            .setView(dialogView)
++            .setNegativeButton(R.string.cancel, null)
++            .setPositiveButton(R.string.warning_emergency_unlock_confirm) { _, _ ->
++                val password = passwordField.text?.toString().orEmpty()
++                lifecycleScope.launch {
++                    val passwordHash = DataStoreManager(applicationContext).settings.first()
++                        .unlockGapConfig.emergencyPasswordHash
++                    if (passwordHash.isEmpty() ||
++                        AntiUninstallManager.hashPassword(password) != passwordHash
++                    ) {
++                        Toast.makeText(
++                            this@WarningActivity,
++                            R.string.anti_uninstall_wrong_password,
++                            Toast.LENGTH_SHORT
++                        ).show()
++                        return@launch
++                    }
++                    sendEmergencyUnlock(warningScreenConfig, groupId)
++                }
++            }
++            .show()
++    }
++
++    /** Unlocks for the group's normal time, skipping the wait, the limits and any challenge. */
++    private fun sendEmergencyUnlock(warningScreenConfig: AppBlockerWarningScreenConfig, groupId: String) {
++        val minutes = if (warningScreenConfig.isOnOpenConfig) {
++            1440
++        } else {
++            (warningScreenConfig.timeInterval / 60_000L).coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
++        }
++        binding.btnEmergency.isEnabled = false
++        binding.btnProceed.isEnabled = false
++        sendRefreshRequest(
++            groupId,
++            AppBlocker.INTENT_ACTION_REFRESH_APP_BLOCKER_COOLDOWN,
++            minutes,
++            isEmergency = true,
++            onDelivered = {
++                try {
++                    val launchPackage = intent.getStringExtra("launch_package") ?: groupId
++                    packageManager.getLaunchIntentForPackage(launchPackage)
++                        ?.let(::startActivity)
++                } finally {
++                    closeWarningScreen()
++                }
++            }
++        )
++    }
++
+     private fun setupAdaptiveMathChallenge(questionCount: Int, startingLevel: Int) {
+         val challenge = AdaptiveMathChallenge(
+             requiredAnswers = questionCount.coerceIn(
+@@ -707,6 +825,7 @@ class WarningActivity : AppCompatActivity() {
+         super.onDestroy()
+         stopNfcUnlockScan()
+         proceedTimer?.cancel()
++        unlockGapTimer?.cancel()
+         mathRetryTimer?.cancel()
+         vibrator?.cancel()
+         dialog?.dismiss()
+@@ -716,11 +835,13 @@ class WarningActivity : AppCompatActivity() {
+         id: String,
+         action: String,
+         time: Int,
++        isEmergency: Boolean = false,
+         onDelivered: (() -> Unit)? = null
+     ) {
+         val intent = Intent(action).setPackage(packageName)
+         intent.putExtra("result_id", id)
+         intent.putExtra("selected_time", time * 60_000L)
++        if (isEmergency) intent.putExtra(AppBlocker.EXTRA_EMERGENCY, true)
+         if (onDelivered == null) {
+             sendBroadcast(intent)
+             return
+@@ -807,5 +928,6 @@ class WarningActivity : AppCompatActivity() {
+         const val MAX_ADAPTIVE_MATH_LEVEL = 10
+         const val MIN_FOCUS_GOAL_MINUTES = 15
+         const val MAX_FOCUS_GOAL_MINUTES = 24 * 60
++        const val MAX_UNLOCK_GAP_MS = 7 * 24 * 60 * 60_000L
+     }
+ }
+diff --git a/app/src/main/java/neth/iecal/curbox/ui/fragments/main/reducers/ReducersFragment.kt b/app/src/main/java/neth/iecal/curbox/ui/fragments/main/reducers/ReducersFragment.kt
+index b2ea98b0..ac887f44 100644
+--- a/app/src/main/java/neth/iecal/curbox/ui/fragments/main/reducers/ReducersFragment.kt
++++ b/app/src/main/java/neth/iecal/curbox/ui/fragments/main/reducers/ReducersFragment.kt
+@@ -121,6 +121,14 @@ class ReducersFragment : Fragment() {
+             startActivity(intent)
+         }
+ 
++        val unlockGapCard = view.findViewById<MaterialCardView>(R.id.card_unlock_gap)
++        unlockGapCard.setOnClickListener {
++            val intent = Intent(requireContext(), FragmentActivity::class.java).apply {
++                putExtra("fragment", neth.iecal.curbox.ui.fragments.main.reducers.advanced.UnlockGapFragment.FRAGMENT_ID)
++            }
++            startActivity(intent)
++        }
++
+         val settingsChangeDelayCard = view.findViewById<MaterialCardView>(R.id.card_settings_change_delay)
+         settingsChangeDelayCard.setOnClickListener {
+             val intent = Intent(requireContext(), FragmentActivity::class.java).apply {
+diff --git a/app/src/main/java/neth/iecal/curbox/ui/fragments/main/reducers/advanced/UnlockGapFragment.kt b/app/src/main/java/neth/iecal/curbox/ui/fragments/main/reducers/advanced/UnlockGapFragment.kt
+new file mode 100644
+index 00000000..5e3434c0
+--- /dev/null
++++ b/app/src/main/java/neth/iecal/curbox/ui/fragments/main/reducers/advanced/UnlockGapFragment.kt
+@@ -0,0 +1,214 @@
++package neth.iecal.curbox.ui.fragments.main.reducers.advanced
++
++import android.os.Bundle
++import android.text.format.DateFormat
++import android.view.LayoutInflater
++import android.view.View
++import android.view.ViewGroup
++import android.widget.LinearLayout
++import android.widget.TextView
++import android.widget.Toast
++import androidx.core.view.isVisible
++import androidx.fragment.app.Fragment
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.lifecycleScope
++import androidx.lifecycle.repeatOnLifecycle
++import com.google.android.material.button.MaterialButton
++import com.google.android.material.dialog.MaterialAlertDialogBuilder
++import com.google.android.material.slider.Slider
++import com.google.android.material.textfield.TextInputEditText
++import com.google.android.material.timepicker.MaterialTimePicker
++import com.google.android.material.timepicker.TimeFormat
++import kotlinx.coroutines.launch
++import neth.iecal.curbox.R
++import neth.iecal.curbox.data.models.UnlockGapConfig
++import neth.iecal.curbox.utils.AntiUninstallManager
++import neth.iecal.curbox.utils.DataStoreManager
++import neth.iecal.curbox.utils.ViewUtils
++import java.text.DateFormatSymbols
++import java.util.Calendar
++
++/**
++ * Shared settings for the growing wait between app group unlocks: when each day ends, and the
++ * emergency password. Changes go through the settings change delay like other restrictions.
++ */
++class UnlockGapFragment : Fragment() {
++
++    companion object {
++        const val FRAGMENT_ID = "unlock_gap"
++    }
++
++    private lateinit var dataStore: DataStoreManager
++    private lateinit var containerDayEnds: LinearLayout
++    private lateinit var textEmergencyStatus: TextView
++    private lateinit var btnEmergencySet: MaterialButton
++    private lateinit var btnEmergencyRemove: MaterialButton
++    private lateinit var groupEmergencyPerDay: View
++    private lateinit var textEmergencyPerDay: TextView
++    private lateinit var sliderEmergencyPerDay: Slider
++
++    private var config = UnlockGapConfig()
++
++    override fun onCreateView(
++        inflater: LayoutInflater,
++        container: ViewGroup?,
++        savedInstanceState: Bundle?
++    ): View {
++        val view = inflater.inflate(R.layout.fragment_unlock_gap, container, false)
++        dataStore = DataStoreManager(requireContext())
++
++        containerDayEnds = view.findViewById(R.id.container_day_ends)
++        textEmergencyStatus = view.findViewById(R.id.text_emergency_status)
++        btnEmergencySet = view.findViewById(R.id.btn_emergency_set)
++        btnEmergencyRemove = view.findViewById(R.id.btn_emergency_remove)
++        groupEmergencyPerDay = view.findViewById(R.id.group_emergency_per_day)
++        textEmergencyPerDay = view.findViewById(R.id.text_emergency_per_day)
++        sliderEmergencyPerDay = view.findViewById(R.id.slider_emergency_per_day)
++
++        view.findViewById<MaterialButton>(R.id.btn_back).setOnClickListener {
++            requireActivity().onBackPressedDispatcher.onBackPressed()
++        }
++        view.findViewById<MaterialButton>(R.id.btn_help).setOnClickListener {
++            ViewUtils.showHelpPopup(it, getString(R.string.unlock_gap_help_popup), null)
++        }
++
++        btnEmergencySet.setOnClickListener {
++            showSetPasswordDialog { hash -> requestUpdate { it.copy(emergencyPasswordHash = hash) } }
++        }
++        btnEmergencyRemove.setOnClickListener {
++            requestUpdate { it.copy(emergencyPasswordHash = "") }
++        }
++        sliderEmergencyPerDay.addOnChangeListener { _, value, _ ->
++            textEmergencyPerDay.text = getString(R.string.unlock_gap_emergency_per_day, value.toInt())
++        }
++        sliderEmergencyPerDay.addOnSliderTouchListener(object : Slider.OnSliderTouchListener {
++            override fun onStartTrackingTouch(slider: Slider) = Unit
++
++            override fun onStopTrackingTouch(slider: Slider) {
++                val count = slider.value.toInt()
++                if (count != config.emergencyUnlocksPerDay) {
++                    requestUpdate { it.copy(emergencyUnlocksPerDay = count) }
++                }
++            }
++        })
++
++        viewLifecycleOwner.lifecycleScope.launch {
++            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
++                dataStore.settingsForEditing.collect { settings ->
++                    config = settings.unlockGapConfig
++                    render()
++                }
++            }
++        }
++
++        return view
++    }
++
++    private fun requestUpdate(transform: (UnlockGapConfig) -> UnlockGapConfig) {
++        viewLifecycleOwner.lifecycleScope.launch {
++            dataStore.updateUnlockGapConfig(transform)
++        }
++    }
++
++    private fun render() {
++        if (!isAdded) return
++        renderDayEnds()
++
++        val hasPassword = config.emergencyPasswordHash.isNotEmpty()
++        textEmergencyStatus.setText(
++            if (hasPassword) R.string.unlock_gap_emergency_on else R.string.unlock_gap_emergency_off
++        )
++        btnEmergencySet.setText(
++            if (hasPassword) R.string.unlock_gap_emergency_change else R.string.unlock_gap_emergency_set
++        )
++        btnEmergencyRemove.isVisible = hasPassword
++        groupEmergencyPerDay.isVisible = hasPassword
++        val perDay = config.emergencyUnlocksPerDay.coerceIn(1, UnlockGapConfig.MAX_EMERGENCY_UNLOCKS_PER_DAY)
++        sliderEmergencyPerDay.value = perDay.toFloat()
++        textEmergencyPerDay.text = getString(R.string.unlock_gap_emergency_per_day, perDay)
++    }
++
++    private fun renderDayEnds() {
++        containerDayEnds.removeAllViews()
++        val weekdayNames = DateFormatSymbols.getInstance().weekdays
++        for (weekday in 0..6) {
++            val minutes = config.dayEndMinutes.getOrElse(weekday) { 0 }
++            val row = MaterialButton(
++                requireContext(),
++                null,
++                com.google.android.material.R.attr.materialButtonOutlinedStyle
++            ).apply {
++                layoutParams = LinearLayout.LayoutParams(
++                    LinearLayout.LayoutParams.MATCH_PARENT,
++                    LinearLayout.LayoutParams.WRAP_CONTENT
++                )
++                text = getString(
++                    R.string.unlock_gap_day_end_row,
++                    weekdayNames[weekday + Calendar.SUNDAY],
++                    formatTime(minutes)
++                )
++                setOnClickListener { showDayEndPicker(weekday, minutes) }
++            }
++            containerDayEnds.addView(row)
++        }
++    }
++
++    private fun showDayEndPicker(weekday: Int, currentMinutes: Int) {
++        val clockFormat = if (DateFormat.is24HourFormat(requireContext())) {
++            TimeFormat.CLOCK_24H
++        } else {
++            TimeFormat.CLOCK_12H
++        }
++        val picker = MaterialTimePicker.Builder()
++            .setTimeFormat(clockFormat)
++            .setHour(currentMinutes / 60)
++            .setMinute(currentMinutes % 60)
++            .setTitleText(R.string.unlock_gap_day_end_title)
++            .build()
++        picker.addOnPositiveButtonClickListener {
++            val minutes = picker.hour * 60 + picker.minute
++            if (minutes > UnlockGapConfig.MAX_DAY_END_MINUTES) {
++                Toast.makeText(requireContext(), R.string.unlock_gap_day_end_too_late, Toast.LENGTH_SHORT).show()
++                return@addOnPositiveButtonClickListener
++            }
++            requestUpdate { current ->
++                val dayEnds = current.dayEndMinutes.toMutableList()
++                while (dayEnds.size < 7) dayEnds.add(0)
++                dayEnds[weekday] = minutes
++                current.copy(dayEndMinutes = dayEnds.take(7))
++            }
++        }
++        picker.show(childFragmentManager, "unlock_gap_day_end")
++    }
++
++    private fun formatTime(minutesAfterMidnight: Int): String {
++        val time = Calendar.getInstance().apply {
++            set(Calendar.HOUR_OF_DAY, minutesAfterMidnight / 60)
++            set(Calendar.MINUTE, minutesAfterMidnight % 60)
++        }
++        return DateFormat.getTimeFormat(requireContext()).format(time.time)
++    }
++
++    private fun showSetPasswordDialog(onPassword: (hash: String) -> Unit) {
++        val dialogView = layoutInflater.inflate(R.layout.dialog_anti_uninstall_password, null)
++        val passwordField = dialogView.findViewById<TextInputEditText>(R.id.input_password)
++        val confirmField = dialogView.findViewById<TextInputEditText>(R.id.input_confirm)
++
++        MaterialAlertDialogBuilder(requireContext())
++            .setTitle(R.string.anti_uninstall_set_password_title)
++            .setView(dialogView)
++            .setNegativeButton(R.string.anti_uninstall_cancel, null)
++            .setPositiveButton(R.string.anti_uninstall_save) { _, _ ->
++                val password = passwordField.text?.toString().orEmpty()
++                val confirm = confirmField.text?.toString().orEmpty()
++                when {
++                    password.length < 4 ->
++                        Toast.makeText(requireContext(), R.string.anti_uninstall_password_too_short, Toast.LENGTH_SHORT).show()
++                    password != confirm ->
++                        Toast.makeText(requireContext(), R.string.anti_uninstall_password_mismatch, Toast.LENGTH_SHORT).show()
++                    else -> onPassword(AntiUninstallManager.hashPassword(password))
++                }
++            }
++            .show()
++    }
++}
+diff --git a/app/src/main/java/neth/iecal/curbox/ui/fragments/main/reducers/blockertools/shared/WarningConfigFormController.kt b/app/src/main/java/neth/iecal/curbox/ui/fragments/main/reducers/blockertools/shared/WarningConfigFormController.kt
+index 4a8df8b7..31624210 100644
+--- a/app/src/main/java/neth/iecal/curbox/ui/fragments/main/reducers/blockertools/shared/WarningConfigFormController.kt
++++ b/app/src/main/java/neth/iecal/curbox/ui/fragments/main/reducers/blockertools/shared/WarningConfigFormController.kt
+@@ -124,6 +124,20 @@ internal class WarningConfigFormController(
+         )
+         updateProceedWindowInput(initialInputValue)
+ 
++        // The wait between unlocks is tracked by the app blocker, so only app groups offer it
++        binding.unlockGapSwitch.isVisible = supportsOnEachOpen
++        binding.unlockGapSwitch.isChecked = supportsOnEachOpen && config.isUnlockGapEnabled
++        binding.unlockGapContainer.isVisible = binding.unlockGapSwitch.isChecked
++        val unlockGapStart = config.unlockGapStartMn.coerceAtLeast(1)
++        binding.unlockGapStartSlider.value = unlockGapStart.toFloat().coerceAtMost(60f)
++        updateUnlockGapStartInput(unlockGapStart.toLong())
++        val unlockGapStep = config.unlockGapStepMn.coerceAtLeast(0)
++        binding.unlockGapStepSlider.value = unlockGapStep.toFloat().coerceAtMost(30f)
++        updateUnlockGapStepInput(unlockGapStep.toLong())
++        val unlockGapMax = config.unlockGapMaxMn.coerceAtLeast(1)
++        binding.unlockGapMaxSlider.value = unlockGapMax.toFloat().coerceAtMost(240f)
++        updateUnlockGapMaxInput(unlockGapMax.toLong())
++
+         binding.warningMsgEdit.setText(config.message.joinToString(", "))
+         binding.switchVibrateBrightness.isChecked = config.vibrateAndIncBrightness
+     }
+@@ -166,6 +180,27 @@ internal class WarningConfigFormController(
+         binding.proceedLimitSwitch.setOnCheckedChangeListener { _, isChecked ->
+             binding.proceedLimitContainer.isVisible = isChecked
+         }
++        binding.unlockGapSwitch.setOnCheckedChangeListener { _, isChecked ->
++            binding.unlockGapContainer.isVisible = isChecked
++        }
++        setupNumericInput(
++            binding.unlockGapStartSlider,
++            binding.unlockGapStartInput,
++            binding.unlockGapStartInputLayout,
++            updateInput = ::updateUnlockGapStartInput
++        )
++        setupNumericInput(
++            binding.unlockGapStepSlider,
++            binding.unlockGapStepInput,
++            binding.unlockGapStepInputLayout,
++            updateInput = ::updateUnlockGapStepInput
++        )
++        setupNumericInput(
++            binding.unlockGapMaxSlider,
++            binding.unlockGapMaxInput,
++            binding.unlockGapMaxInputLayout,
++            updateInput = ::updateUnlockGapMaxInput
++        )
+         binding.switchOnEachOpen.setOnCheckedChangeListener { _, isChecked ->
+             val challengeIndex = selectedChallengeIndex()
+             if (isChecked && challengeIndex == WarningUnlockSelectionMapper.NO_EFFORT_INDEX) {
+@@ -289,7 +324,11 @@ internal class WarningConfigFormController(
+             proceedLimitEnabled = binding.proceedLimitSwitch.isChecked,
+             allowedProceeds = numericInputValue(binding.allowedProceedsInput).toInt(),
+             proceedsTimeWindowMn = selectedProceedWindowMinutes(),
+-            isOnOpenConfig = isOnEachOpenEnabled()
++            isOnOpenConfig = isOnEachOpenEnabled(),
++            isUnlockGapEnabled = supportsOnEachOpen && binding.unlockGapSwitch.isChecked,
++            unlockGapStartMn = numericInputValue(binding.unlockGapStartInput).toInt(),
++            unlockGapStepMn = numericInputValue(binding.unlockGapStepInput).toInt(),
++            unlockGapMaxMn = numericInputValue(binding.unlockGapMaxInput).toInt()
+         )
+     }
+ 
+@@ -407,6 +446,24 @@ internal class WarningConfigFormController(
+                 binding.focusGoalMinutesSlider,
+                 binding.focusGoalMinutesInput,
+                 binding.focusGoalMinutesInputLayout
++            ),
++            NumericInput(
++                binding.unlockGapStartSlider,
++                binding.unlockGapStartInput,
++                binding.unlockGapStartInputLayout,
++                MAX_UNLOCK_GAP_MINUTES
++            ),
++            NumericInput(
++                binding.unlockGapStepSlider,
++                binding.unlockGapStepInput,
++                binding.unlockGapStepInputLayout,
++                MAX_UNLOCK_GAP_MINUTES
++            ),
++            NumericInput(
++                binding.unlockGapMaxSlider,
++                binding.unlockGapMaxInput,
++                binding.unlockGapMaxInputLayout,
++                MAX_UNLOCK_GAP_MINUTES
+             )
+         )
+     }
+@@ -627,6 +684,18 @@ internal class WarningConfigFormController(
+         setNumericInputValue(binding.focusGoalMinutesInput, value)
+     }
+ 
++    private fun updateUnlockGapStartInput(value: Long) {
++        setNumericInputValue(binding.unlockGapStartInput, value)
++    }
++
++    private fun updateUnlockGapStepInput(value: Long) {
++        setNumericInputValue(binding.unlockGapStepInput, value)
++    }
++
++    private fun updateUnlockGapMaxInput(value: Long) {
++        setNumericInputValue(binding.unlockGapMaxInput, value)
++    }
++
+     private fun unitOptions(): List<String> {
+         return listOf(
+             fragment.getString(R.string.unit_minutes),
+@@ -658,6 +727,7 @@ internal class WarningConfigFormController(
+         const val MAX_MATH_LEVEL = 10
+         const val MIN_FOCUS_MINUTES = 15
+         const val MAX_FOCUS_MINUTES = 24 * 60
++        const val MAX_UNLOCK_GAP_MINUTES = 24 * 60L
+     }
+ }
+ 
+diff --git a/app/src/main/java/neth/iecal/curbox/utils/DataStore.kt b/app/src/main/java/neth/iecal/curbox/utils/DataStore.kt
+index fb2102a2..c6b921e0 100644
+--- a/app/src/main/java/neth/iecal/curbox/utils/DataStore.kt
++++ b/app/src/main/java/neth/iecal/curbox/utils/DataStore.kt
+@@ -242,6 +242,7 @@ class DataStoreManager(private val context: Context) {
+                 uiHiderConfig = current.uiHiderConfig,
+                 nextWebsiteRecheckTime = current.nextWebsiteRecheckTime,
+                 settingsChangeDelayConfig2 = delayConfig,
++                unlockGapConfig = current.unlockGapConfig,
+             )
+ 
+             for (field in GatedSettingsField.values()) {
+@@ -389,6 +390,10 @@ class DataStoreManager(private val context: Context) {
+         updateGated(GatedSettingsField.MINDFUL_MESSAGES) { config }
+     }
+ 
++    suspend fun updateUnlockGapConfig(transform: (neth.iecal.curbox.data.models.UnlockGapConfig) -> neth.iecal.curbox.data.models.UnlockGapConfig) {
++        updateGated(GatedSettingsField.UNLOCK_GAP) { transform(it.unlockGapConfig) }
++    }
++
+     suspend fun updateUiHiderConfig(transform: (neth.iecal.curbox.data.models.UiHiderConfig) -> neth.iecal.curbox.data.models.UiHiderConfig) {
+         updateGated(GatedSettingsField.UI_HIDER) { transform(it.uiHiderConfig.normalized()) }
+     }
+@@ -703,6 +708,9 @@ class DataStoreManager(private val context: Context) {
+                         requireTamperProtectionOff = prefs.requireTamperProtectionOff
+                     ))
+                 }
++                GatedSettingsField.UNLOCK_GAP -> settings.copy(
++                    unlockGapConfig = gson.fromJson(valueJson, neth.iecal.curbox.data.models.UnlockGapConfig::class.java)
++                )
+             }
+         }.getOrNull()
+     }
+@@ -729,6 +737,7 @@ class DataStoreManager(private val context: Context) {
+                     requireTamperProtectionOff =
+                         settings.settingsChangeDelayConfig2.requireTamperProtectionOff,
+                 )
++                GatedSettingsField.UNLOCK_GAP -> settings.unlockGapConfig
+             }
+             gson.toJson(value)
+         }.getOrNull()
+diff --git a/app/src/main/java/neth/iecal/curbox/utils/RestrictionComparator.kt b/app/src/main/java/neth/iecal/curbox/utils/RestrictionComparator.kt
+index 5112afc4..db185ff3 100755
+--- a/app/src/main/java/neth/iecal/curbox/utils/RestrictionComparator.kt
++++ b/app/src/main/java/neth/iecal/curbox/utils/RestrictionComparator.kt
+@@ -17,6 +17,7 @@ import neth.iecal.curbox.data.models.Settings
+ import neth.iecal.curbox.data.models.SettingsChangeDelayConfig
+ import neth.iecal.curbox.data.models.TimeInterval
+ import neth.iecal.curbox.data.models.UiHiderConfig
++import neth.iecal.curbox.data.models.UnlockGapConfig
+ import neth.iecal.curbox.data.models.upgradeLegacyConfig
+ import neth.iecal.curbox.hardcoded.allScripts
+ 
+@@ -59,12 +60,25 @@ object RestrictionComparator {
+                     !current.isWebsiteUsageTrackingEnabled || proposed.isWebsiteUsageTrackingEnabled
+                 GatedSettingsField.CHANGE_DELAY ->
+                     changeDelay(current.settingsChangeDelayConfig2, proposed.settingsChangeDelayConfig2)
++                GatedSettingsField.UNLOCK_GAP ->
++                    unlockGap(current.unlockGapConfig, proposed.unlockGapConfig)
+             }
+         } catch (e: Exception) {
+             false
+         }
+     }
+ 
++    fun unlockGap(old: UnlockGapConfig, new: UnlockGapConfig): Boolean {
++        // Moving a day end changes when streaks reset, which can't be proven stricter
++        val dayEndsOk = old.dayEndMinutes == new.dayEndMinutes
++        // A new or changed password is a new way past the block; removing it is stricter
++        val passwordOk = new.emergencyPasswordHash.isEmpty() ||
++            new.emergencyPasswordHash == old.emergencyPasswordHash
++        val emergencyCountOk = new.emergencyPasswordHash.isEmpty() ||
++            new.emergencyUnlocksPerDay <= old.emergencyUnlocksPerDay
++        return dayEndsOk && passwordOk && emergencyCountOk
++    }
++
+     fun changeDelay(old: SettingsChangeDelayConfig, new: SettingsChangeDelayConfig): Boolean {
+         // Off or set to no wait means the timer holds nothing, so any change to it passes
+         val timeOk = !old.isEnabled || old.delayMinutes <= 0 ||
+@@ -320,6 +334,14 @@ object RestrictionComparator {
+         val dialogHiddenOk = !o.isWarningDialogHidden || n.isWarningDialogHidden
+         val proceedDelayOk = n.proceedDelayInSecs >= o.proceedDelayInSecs
+         val vibrateOk = !o.vibrateAndIncBrightness || n.vibrateAndIncBrightness
++        val unlockGapOk = when {
++            o.isUnlockGapEnabled && !n.isUnlockGapEnabled -> false
++            o.isUnlockGapEnabled && n.isUnlockGapEnabled ->
++                n.unlockGapStartMn >= o.unlockGapStartMn &&
++                    n.unlockGapStepMn >= o.unlockGapStepMn &&
++                    n.unlockGapMaxMn >= o.unlockGapMaxMn
++            else -> true
++        }
+         val proceedLimitOk = when {
+             o.proceedLimitEnabled && !n.proceedLimitEnabled -> false
+             o.proceedLimitEnabled && n.proceedLimitEnabled ->
+@@ -359,7 +381,7 @@ object RestrictionComparator {
+ 
+         return onEachOpenOk && cooldownOk && dynamicIntervalOk &&
+             proceedDisabledOk && dialogHiddenOk &&
+-            proceedDelayOk && vibrateOk && proceedLimitOk && qrOk && nfcOk && typingOk && intentOk &&
++            proceedDelayOk && vibrateOk && proceedLimitOk && unlockGapOk && qrOk && nfcOk && typingOk && intentOk &&
+             adaptiveMathOk && adaptiveMathQuestionCountOk && adaptiveMathStartingLevelOk &&
+             focusGoalOk && intentMinLengthOk
+     }
+diff --git a/app/src/main/java/neth/iecal/curbox/utils/SettingsBackupCodec.kt b/app/src/main/java/neth/iecal/curbox/utils/SettingsBackupCodec.kt
+index 66e2d135..8bae3f32 100644
+--- a/app/src/main/java/neth/iecal/curbox/utils/SettingsBackupCodec.kt
++++ b/app/src/main/java/neth/iecal/curbox/utils/SettingsBackupCodec.kt
+@@ -10,6 +10,7 @@ import neth.iecal.curbox.data.models.PomodoroState
+ import neth.iecal.curbox.data.models.Settings
+ import neth.iecal.curbox.data.models.SettingsChangeDelayConfig
+ import neth.iecal.curbox.data.models.UiHiderConfig
++import neth.iecal.curbox.data.models.UnlockGapConfig
+ import neth.iecal.curbox.data.models.upgradeLegacyAppGroupConfigs
+ import neth.iecal.curbox.data.models.upgradeLegacyKeywordGroupConfigs
+ import neth.iecal.curbox.data.models.upgradeLegacyConfig
+@@ -140,6 +141,7 @@ object SettingsBackupCodec {
+             require(config.allowedProceeds >= 0 && config.proceedsTimeWindowMn in 1..Long.MAX_VALUE / 60_000L)
+             require(config.qrKeys.values.all { it == -1L || it > 0L })
+             require(config.nfcKeys.values.all { it == -1L || it > 0L })
++            require(config.unlockGapStartMn >= 0 && config.unlockGapStepMn >= 0 && config.unlockGapMaxMn >= 0)
+         }
+         settings.blockedAppGroups.forEach {
+             requireNotNull(it.blockingType)
+@@ -166,6 +168,10 @@ object SettingsBackupCodec {
+         settings.grayscaleGroups.forEach { schedule(it.timeConfig) }
+         requireNotNull(settings.antiUninstallConfig2.mode)
+         require(settings.settingsChangeDelayConfig2.delayMinutes in 0..SettingsChangeDelayConfig.MAX_DELAY_MINUTES)
++        settings.unlockGapConfig.let {
++            require(it.dayEndMinutes.size == 7 && it.dayEndMinutes.all { minutes -> minutes in 0..UnlockGapConfig.MAX_DAY_END_MINUTES })
++            require(it.emergencyUnlocksPerDay in 0..UnlockGapConfig.MAX_EMERGENCY_UNLOCKS_PER_DAY)
++        }
+         require(settings.mindfulMessageConfig.textSize.isFinite() && settings.mindfulMessageConfig.textSize > 0f)
+         require(settings.reelCounterOverlayConfig.textSize.isFinite() && settings.reelCounterOverlayConfig.textSize > 0f)
+         require(settings.mindfulMessageConfig.positionX.isFinite() && settings.mindfulMessageConfig.positionY.isFinite())
+diff --git a/app/src/main/java/neth/iecal/curbox/utils/SettingsChangeDelayUtils.kt b/app/src/main/java/neth/iecal/curbox/utils/SettingsChangeDelayUtils.kt
+index 8256652e..1cea9997 100644
+--- a/app/src/main/java/neth/iecal/curbox/utils/SettingsChangeDelayUtils.kt
++++ b/app/src/main/java/neth/iecal/curbox/utils/SettingsChangeDelayUtils.kt
+@@ -63,6 +63,7 @@ object SettingsChangeDelayUtils {
+                 GatedSettingsField.UI_HIDER -> R.string.change_delay_field_ui_hider
+                 GatedSettingsField.APP_USAGE_TRACKING -> R.string.app_usage_tracking
+                 GatedSettingsField.WEBSITE_USAGE_TRACKING -> R.string.website_usage_tracking
++                GatedSettingsField.UNLOCK_GAP -> R.string.change_delay_field_unlock_gap
+                 GatedSettingsField.CHANGE_DELAY, null -> R.string.change_delay_field_change_delay
+             }
+         )
+diff --git a/app/src/main/res/layout/dialog_warning_overlay.xml b/app/src/main/res/layout/dialog_warning_overlay.xml
+index b3b550f9..dc124649 100644
+--- a/app/src/main/res/layout/dialog_warning_overlay.xml
++++ b/app/src/main/res/layout/dialog_warning_overlay.xml
+@@ -27,6 +27,16 @@
+         tools:text="You've 1 of 2 opens left"
+         android:visibility="gone" />
+ 
++    <TextView
++        android:id="@+id/unlock_gap_next"
++        style="@style/TextAppearance.Material3.BodyMedium"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_marginTop="8dp"
++        android:gravity="center"
++        tools:text="After this unlock, the next one waits 3 minutes."
++        android:visibility="gone" />
++
+     <neth.iecal.curbox.ui.views.HorizontalNumberPicker
+         android:id="@+id/mins_picker"
+         android:layout_width="wrap_content"
+@@ -163,4 +173,14 @@
+         android:text="@string/cancel"
+         android:textAllCaps="true" />
+ 
++    <Button
++        android:id="@+id/btn_emergency"
++        style="@style/Widget.Material3.Button.TextButton"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_marginHorizontal="8dp"
++        android:layout_marginBottom="8dp"
++        android:visibility="gone"
++        tools:text="Emergency unlock (1 left)" />
++
+ </LinearLayout>
+diff --git a/app/src/main/res/layout/fragment_reducers.xml b/app/src/main/res/layout/fragment_reducers.xml
+index 967fffef..4dd6308f 100644
+--- a/app/src/main/res/layout/fragment_reducers.xml
++++ b/app/src/main/res/layout/fragment_reducers.xml
+@@ -819,6 +819,69 @@
+             </LinearLayout>
+         </com.google.android.material.card.MaterialCardView>
+ 
++        <com.google.android.material.card.MaterialCardView
++            android:id="@+id/card_unlock_gap"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:layout_marginBottom="20dp"
++            app:cardBackgroundColor="?attr/colorSurfaceContainer"
++            app:cardCornerRadius="16dp"
++            app:cardElevation="0dp"
++            app:strokeWidth="0dp">
++
++            <LinearLayout
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:gravity="center_vertical"
++                android:padding="20dp">
++
++                <com.google.android.material.card.MaterialCardView
++                    android:layout_width="48dp"
++                    android:layout_height="48dp"
++                    app:cardBackgroundColor="?attr/colorSecondaryContainer"
++                    app:cardCornerRadius="14dp"
++                    app:cardElevation="0dp"
++                    app:strokeWidth="0dp">
++
++                    <ImageView
++                        android:layout_width="24dp"
++                        android:layout_height="24dp"
++                        android:layout_gravity="center"
++                        android:src="@drawable/ic_timer_aesthetic"
++                        app:tint="?attr/colorSecondary" />
++                </com.google.android.material.card.MaterialCardView>
++
++                <LinearLayout
++                    android:layout_width="0dp"
++                    android:layout_height="wrap_content"
++                    android:layout_marginStart="16dp"
++                    android:layout_weight="1"
++                    android:orientation="vertical">
++
++                    <TextView
++                        android:layout_width="wrap_content"
++                        android:layout_height="wrap_content"
++                        android:text="@string/unlock_gap_title"
++                        android:textColor="?attr/colorOnSurface"
++                        android:textSize="16sp"
++                        android:textStyle="bold" />
++
++                    <TextView
++                        android:layout_width="wrap_content"
++                        android:layout_height="wrap_content"
++                        android:text="@string/unlock_gap_card_subtitle"
++                        android:textColor="?attr/colorOnSurfaceVariant"
++                        android:textSize="13sp" />
++                </LinearLayout>
++
++                <ImageView
++                    android:layout_width="16dp"
++                    android:layout_height="16dp"
++                    android:src="@drawable/baseline_arrow_forward_ios_24"
++                    app:tint="?attr/colorOutline" />
++            </LinearLayout>
++        </com.google.android.material.card.MaterialCardView>
++
+         <com.google.android.material.card.MaterialCardView
+             android:id="@+id/card_settings_change_delay"
+             android:layout_width="match_parent"
+diff --git a/app/src/main/res/layout/fragment_unlock_gap.xml b/app/src/main/res/layout/fragment_unlock_gap.xml
+new file mode 100644
+index 00000000..4ec94078
+--- /dev/null
++++ b/app/src/main/res/layout/fragment_unlock_gap.xml
+@@ -0,0 +1,174 @@
++<?xml version="1.0" encoding="utf-8"?>
++<androidx.core.widget.NestedScrollView xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    android:layout_width="match_parent"
++    android:layout_height="match_parent">
++
++    <LinearLayout
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:orientation="vertical"
++        android:paddingHorizontal="16dp"
++        android:paddingTop="16dp"
++        android:paddingBottom="120dp">
++
++        <RelativeLayout
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content">
++
++            <com.google.android.material.button.MaterialButton
++                android:id="@+id/btn_back"
++                style="@style/Widget.Material3.Button.IconButton"
++                android:layout_width="48dp"
++                android:layout_height="48dp"
++                android:layout_alignParentStart="true"
++                android:layout_centerVertical="true"
++                app:icon="@drawable/baseline_arrow_back_ios_24"
++                app:iconTint="?attr/colorOnSurface" />
++
++            <TextView
++                android:layout_width="wrap_content"
++                android:layout_height="wrap_content"
++                android:layout_centerInParent="true"
++                android:text="@string/unlock_gap_title"
++                android:textAppearance="@style/TextAppearance.Material3.TitleLarge"
++                android:textColor="?attr/colorOnSurface" />
++
++            <com.google.android.material.button.MaterialButton
++                android:id="@+id/btn_help"
++                style="@style/Widget.Material3.Button.IconButton"
++                android:layout_width="48dp"
++                android:layout_height="48dp"
++                android:layout_alignParentEnd="true"
++                android:layout_centerVertical="true"
++                app:icon="@drawable/baseline_question_mark_24"
++                app:iconTint="?attr/colorOnSurface" />
++        </RelativeLayout>
++
++        <!-- Day ends -->
++        <com.google.android.material.card.MaterialCardView
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:layout_marginTop="24dp"
++            app:cardBackgroundColor="?attr/colorSurfaceContainer"
++            app:cardCornerRadius="20dp"
++            app:cardElevation="0dp"
++            app:strokeWidth="0dp">
++
++            <LinearLayout
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:orientation="vertical"
++                android:padding="20dp">
++
++                <TextView
++                    android:layout_width="wrap_content"
++                    android:layout_height="wrap_content"
++                    android:text="@string/unlock_gap_day_end_title"
++                    android:textAppearance="@style/TextAppearance.Material3.TitleMedium"
++                    android:textColor="?attr/colorOnSurface" />
++
++                <TextView
++                    android:layout_width="match_parent"
++                    android:layout_height="wrap_content"
++                    android:layout_marginTop="4dp"
++                    android:text="@string/unlock_gap_day_end_desc"
++                    android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
++                    android:textColor="?attr/colorOnSurfaceVariant" />
++
++                <LinearLayout
++                    android:id="@+id/container_day_ends"
++                    android:layout_width="match_parent"
++                    android:layout_height="wrap_content"
++                    android:layout_marginTop="12dp"
++                    android:orientation="vertical" />
++            </LinearLayout>
++        </com.google.android.material.card.MaterialCardView>
++
++        <!-- Emergency unlock -->
++        <com.google.android.material.card.MaterialCardView
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:layout_marginTop="16dp"
++            app:cardBackgroundColor="?attr/colorSurfaceContainer"
++            app:cardCornerRadius="20dp"
++            app:cardElevation="0dp"
++            app:strokeWidth="0dp">
++
++            <LinearLayout
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:orientation="vertical"
++                android:padding="20dp">
++
++                <TextView
++                    android:layout_width="wrap_content"
++                    android:layout_height="wrap_content"
++                    android:text="@string/unlock_gap_emergency_title"
++                    android:textAppearance="@style/TextAppearance.Material3.TitleMedium"
++                    android:textColor="?attr/colorOnSurface" />
++
++                <TextView
++                    android:layout_width="match_parent"
++                    android:layout_height="wrap_content"
++                    android:layout_marginTop="4dp"
++                    android:text="@string/unlock_gap_emergency_desc"
++                    android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
++                    android:textColor="?attr/colorOnSurfaceVariant" />
++
++                <TextView
++                    android:id="@+id/text_emergency_status"
++                    android:layout_width="match_parent"
++                    android:layout_height="wrap_content"
++                    android:layout_marginTop="12dp"
++                    android:textAppearance="@style/TextAppearance.Material3.BodyLarge"
++                    android:textColor="?attr/colorOnSurface" />
++
++                <LinearLayout
++                    android:layout_width="match_parent"
++                    android:layout_height="wrap_content"
++                    android:layout_marginTop="8dp"
++                    android:orientation="horizontal">
++
++                    <com.google.android.material.button.MaterialButton
++                        android:id="@+id/btn_emergency_set"
++                        style="@style/Widget.Material3.Button.TonalButton"
++                        android:layout_width="wrap_content"
++                        android:layout_height="wrap_content" />
++
++                    <com.google.android.material.button.MaterialButton
++                        android:id="@+id/btn_emergency_remove"
++                        style="@style/Widget.Material3.Button.TextButton"
++                        android:layout_width="wrap_content"
++                        android:layout_height="wrap_content"
++                        android:layout_marginStart="8dp"
++                        android:text="@string/unlock_gap_emergency_remove" />
++                </LinearLayout>
++
++                <LinearLayout
++                    android:id="@+id/group_emergency_per_day"
++                    android:layout_width="match_parent"
++                    android:layout_height="wrap_content"
++                    android:layout_marginTop="12dp"
++                    android:orientation="vertical">
++
++                    <TextView
++                        android:id="@+id/text_emergency_per_day"
++                        android:layout_width="wrap_content"
++                        android:layout_height="wrap_content"
++                        android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
++                        android:textColor="?attr/colorOnSurface" />
++
++                    <com.google.android.material.slider.Slider
++                        android:id="@+id/slider_emergency_per_day"
++                        android:layout_width="match_parent"
++                        android:layout_height="wrap_content"
++                        android:stepSize="1.0"
++                        android:value="1.0"
++                        android:valueFrom="1.0"
++                        android:valueTo="10.0" />
++                </LinearLayout>
++            </LinearLayout>
++        </com.google.android.material.card.MaterialCardView>
++    </LinearLayout>
++</androidx.core.widget.NestedScrollView>
+diff --git a/app/src/main/res/layout/fragment_warning_config.xml b/app/src/main/res/layout/fragment_warning_config.xml
+index 0467b186..092d28f6 100755
+--- a/app/src/main/res/layout/fragment_warning_config.xml
++++ b/app/src/main/res/layout/fragment_warning_config.xml
+@@ -684,6 +684,106 @@
+                             android:valueTo="60.0" />
+                     </LinearLayout>
+ 
++                    <com.google.android.material.switchmaterial.SwitchMaterial
++                        android:id="@+id/unlock_gap_switch"
++                        style="@style/TextAppearance.Material3.TitleSmall"
++                        android:layout_width="match_parent"
++                        android:layout_height="wrap_content"
++                        android:layout_marginTop="8dp"
++                        android:text="@string/label_unlock_gap"
++                        android:visibility="gone" />
++
++                    <LinearLayout
++                        android:id="@+id/unlock_gap_container"
++                        android:layout_width="match_parent"
++                        android:layout_height="wrap_content"
++                        android:layout_marginTop="8dp"
++                        android:orientation="vertical"
++                        android:visibility="gone">
++
++                        <TextView
++                            style="@style/TextAppearance.Material3.BodySmall"
++                            android:layout_width="match_parent"
++                            android:layout_height="wrap_content"
++                            android:layout_marginBottom="8dp"
++                            android:text="@string/label_unlock_gap_desc" />
++
++                        <com.google.android.material.textfield.TextInputLayout
++                            android:id="@+id/unlock_gap_start_input_layout"
++                            style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
++                            android:layout_width="match_parent"
++                            android:layout_height="wrap_content"
++                            android:hint="@string/label_unlock_gap_start">
++
++                            <com.google.android.material.textfield.TextInputEditText
++                                android:id="@+id/unlock_gap_start_input"
++                                android:layout_width="match_parent"
++                                android:layout_height="wrap_content"
++                                android:imeOptions="actionDone"
++                                android:inputType="number"
++                                android:selectAllOnFocus="true" />
++                        </com.google.android.material.textfield.TextInputLayout>
++
++                        <com.google.android.material.slider.Slider
++                            android:id="@+id/unlock_gap_start_slider"
++                            android:layout_width="match_parent"
++                            android:layout_height="wrap_content"
++                            android:stepSize="1.0"
++                            android:value="1.0"
++                            android:valueFrom="1.0"
++                            android:valueTo="60.0" />
++
++                        <com.google.android.material.textfield.TextInputLayout
++                            android:id="@+id/unlock_gap_step_input_layout"
++                            style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
++                            android:layout_width="match_parent"
++                            android:layout_height="wrap_content"
++                            android:hint="@string/label_unlock_gap_step">
++
++                            <com.google.android.material.textfield.TextInputEditText
++                                android:id="@+id/unlock_gap_step_input"
++                                android:layout_width="match_parent"
++                                android:layout_height="wrap_content"
++                                android:imeOptions="actionDone"
++                                android:inputType="number"
++                                android:selectAllOnFocus="true" />
++                        </com.google.android.material.textfield.TextInputLayout>
++
++                        <com.google.android.material.slider.Slider
++                            android:id="@+id/unlock_gap_step_slider"
++                            android:layout_width="match_parent"
++                            android:layout_height="wrap_content"
++                            android:stepSize="1.0"
++                            android:value="1.0"
++                            android:valueFrom="0.0"
++                            android:valueTo="30.0" />
++
++                        <com.google.android.material.textfield.TextInputLayout
++                            android:id="@+id/unlock_gap_max_input_layout"
++                            style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
++                            android:layout_width="match_parent"
++                            android:layout_height="wrap_content"
++                            android:hint="@string/label_unlock_gap_max">
++
++                            <com.google.android.material.textfield.TextInputEditText
++                                android:id="@+id/unlock_gap_max_input"
++                                android:layout_width="match_parent"
++                                android:layout_height="wrap_content"
++                                android:imeOptions="actionDone"
++                                android:inputType="number"
++                                android:selectAllOnFocus="true" />
++                        </com.google.android.material.textfield.TextInputLayout>
++
++                        <com.google.android.material.slider.Slider
++                            android:id="@+id/unlock_gap_max_slider"
++                            android:layout_width="match_parent"
++                            android:layout_height="wrap_content"
++                            android:stepSize="1.0"
++                            android:value="30.0"
++                            android:valueFrom="1.0"
++                            android:valueTo="240.0" />
++                    </LinearLayout>
++
+                     <com.google.android.material.switchmaterial.SwitchMaterial
+                         android:id="@+id/switch_vibrate_brightness"
+                         style="@style/TextAppearance.Material3.TitleSmall"
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 31d32bc9..220ea698 100755
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -2008,4 +2008,38 @@
+     <string name="onboarding_finish_failed">Could not finish setup. Please try again.</string>
+     <string name="usage_select_background_art">Select background art</string>
+     <string name="usage_background_art_random">Random</string>
++    <!-- Unlock gap and emergency unlock -->
++    <string name="label_unlock_gap">Wait longer after each unlock</string>
++    <string name="label_unlock_gap_desc">After an unlock ends, you must wait before you can unlock again. The wait grows with each unlock and starts over when your day ends. Example: 1, 2, 3 minutes and so on.</string>
++    <string name="label_unlock_gap_start">First wait in minutes</string>
++    <string name="label_unlock_gap_step">Add this many minutes each time</string>
++    <string name="label_unlock_gap_max">Longest wait in minutes</string>
++    <string name="warning_unlock_gap_wait">You just had an unlock. You can unlock again in %1$d:%2$02d.</string>
++    <plurals name="warning_unlock_gap_next">
++        <item quantity="one">After this unlock, the next one waits %1$d minute.</item>
++        <item quantity="other">After this unlock, the next one waits %1$d minutes.</item>
++    </plurals>
++    <plurals name="warning_emergency_unlock_button">
++        <item quantity="one">Emergency unlock (%1$d left today)</item>
++        <item quantity="other">Emergency unlock (%1$d left today)</item>
++    </plurals>
++    <string name="warning_emergency_unlock_title">Emergency unlock</string>
++    <string name="warning_emergency_unlock_message">Type your emergency password. This opens the app right away and skips every wait and check.</string>
++    <string name="warning_emergency_unlock_confirm">Unlock</string>
++    <string name="change_delay_field_unlock_gap">Unlock waits and emergency unlock</string>
++    <string name="unlock_gap_title">Unlock waits</string>
++    <string name="unlock_gap_card_subtitle">When your day ends and your emergency password</string>
++    <string name="unlock_gap_help_popup">App groups can make you wait longer after each unlock. Here you pick when your day ends, so the waits start small again. You can also set an emergency password that unlocks right away.</string>
++    <string name="unlock_gap_day_end_title">When your day ends</string>
++    <string name="unlock_gap_day_end_desc">The waits start over at this time. A late time like 3:00 counts as the same night. Example: Friday at 4:00 means Saturday at 4:00 in the morning.</string>
++    <string name="unlock_gap_day_end_row">%1$s night ends at %2$s</string>
++    <string name="unlock_gap_emergency_title">Emergency unlock</string>
++    <string name="unlock_gap_emergency_desc">A password that unlocks any app group right away, even during a wait. Use it only when you truly need it.</string>
++    <string name="unlock_gap_emergency_off">No password set. Emergency unlock is off.</string>
++    <string name="unlock_gap_emergency_on">Password set.</string>
++    <string name="unlock_gap_emergency_set">Set password</string>
++    <string name="unlock_gap_emergency_change">Change password</string>
++    <string name="unlock_gap_emergency_remove">Remove password</string>
++    <string name="unlock_gap_emergency_per_day">Emergency unlocks per day: %1$d</string>
++    <string name="unlock_gap_day_end_too_late">Pick a time before noon.</string>
+ </resources>
+-- 
+2.54.0.windows.1
+

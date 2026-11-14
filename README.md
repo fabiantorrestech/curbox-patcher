@@ -1,9 +1,10 @@
 # curbox-patcher
 
-Builds [Curbox](https://github.com/curbox-app/curbox-android) releases (fdroid flavor) with two extra patches:
+Builds [Curbox](https://github.com/curbox-app/curbox-android) releases (fdroid flavor) with three extra patches:
 
 - **Grayscale: Curbox only switches off a grayscale filter it switched on itself.** Filters that you or another app (such as GrayScaler+) turn on are left alone. With no grayscale groups, or all groups disabled, Curbox never changes the grayscale setting.
 - **Firefox: links opened from another app are checked right away.** In stock Curbox, a link opened in Firefox from a text or chat showed its first page unblocked, and the block only came on the first tap inside the page.
+- **Unlock waits: a growing wait between app unlocks, plus an emergency password.** After an app group unlock ends, the next unlock waits 1 minute, then 2, then 3 and so on (you pick the numbers per group). The waits start over at your "day end" time, set per weekday. An optional emergency password unlocks right away a few times a day.
 
 Unofficial build, not made by the Curbox developers. Supports Curbox **6 and later** (there was no release 5).
 
@@ -32,9 +33,9 @@ Daily at 09:00 UTC, or when you press "Run workflow"
 9. If it is the newest Curbox release, also replace Curbox.apk on the app hub
 ```
 
-A patch is a list of edits, like "in this file, replace this line with that one." Each new Curbox release gets a fresh copy of the official code, and the edits are applied on top. Applying only fails when Curbox itself changed the same lines a patch edits. The two patches touch different files, so they never conflict with each other.
+A patch is a list of edits, like "in this file, replace this line with that one." Each new Curbox release gets a fresh copy of the official code, and the edits are applied on top. Applying only fails when Curbox itself changed the same lines a patch edits. The patches are applied in name order, each as its own commit, and they apply cleanly together on Curbox 6.
 
-The release name stays `<version>-grayscale` for both patches, so older releases, Obtainium and the "already built" check keep working.
+The release name stays `<version>-grayscale` for all patches, so older releases, Obtainium and the "already built" check keep working.
 
 ### What the grayscale patch changes
 
@@ -57,6 +58,16 @@ Only one Curbox file, `trackers/WebsiteUsageTracker.kt`, and no settings or stor
 - **Checked on a phone:** 10 of 10 links opened from outside Firefox were read within about a second. Typed addresses and Chrome work as before.
 - Other supported browsers get the same extra read, which changes nothing when they already reported the address.
 
+### What the unlock waits patch changes
+
+- **Per app group** (Configure Warning Screen > Advanced > "Wait longer after each unlock"): first wait, minutes added each time, longest wait. Default 1, 1, 30: waits of 1, 2, 3 … 30 minutes.
+- **The wait starts when the unlock ends.** For a timed unlock that is its end time. For "on each open", it is when you leave the group's apps. During the wait the warning screen shows a countdown and no Proceed button, then the normal wait timer runs.
+- **Reducers > Advanced > Unlock waits** holds the shared settings: when each day ends (per weekday, before noon the next morning, e.g. Friday night ends at 4:00) and the emergency password with how many emergency unlocks you get per day.
+- **Emergency unlock** opens the app for the group's normal time and skips the wait, limits and challenges. It does not make the next wait longer.
+- **Settings change delay:** turning waits off, making them shorter, moving a day end, setting a password or allowing more emergencies count as weaker changes and wait out the delay.
+- **Stored data:** new settings fields with defaults (old backups still load). The unlock count lives in the blocker service's own preferences, so it survives a service restart. No database change.
+- **Checked on a phone (Pixel 5, debug build):** waits of 1 then 2 minutes, countdown kept after killing the service, on each open waits start on leaving, wrong password refused, emergency unlock during a wait, day end reset, change delay holds a weaker change.
+
 ## Patching it yourself
 
 ### Usually: nothing
@@ -78,6 +89,7 @@ GitHub emails you that the run failed. Its summary names the patch and lists the
 cd ~/Documents/Developer/repos/curbox-patcher
 scripts/refresh-patch.sh ../curbox-android 7                      # grayscale patch (the default)
 scripts/refresh-patch.sh ../curbox-android 7 firefox-url-rescan   # Firefox patch
+scripts/refresh-patch.sh ../curbox-android 7 unlock-gap           # unlock waits patch
 ```
 
 `7` is the new Curbox release. Run it once for each patch that failed.
@@ -85,7 +97,7 @@ scripts/refresh-patch.sh ../curbox-android 7 firefox-url-rescan   # Firefox patc
 The script:
 1. downloads Curbox 7
 2. moves the patch (one commit on branch `patch/<name>` in `curbox-android`) on top of it
-3. runs the grayscale tests, or builds the fdroid flavor for the Firefox patch
+3. runs the grayscale tests, or builds the fdroid flavor for the other patches
 4. rewrites `patches/<name>.patch`
 
 If it stops on a conflict:
@@ -93,6 +105,7 @@ If it stops on a conflict:
 2. Keep Curbox's new code and put the patch's lines back:
    - grayscale: keep the patch's `grayscaleOwner.…` lines in place of the old `grayscaleControl.enableGrayscale/disableGrayscale` calls
    - Firefox: keep the `scheduleUrlRescan(packageName)` call in `onEvent` and the rescan functions
+   - unlock waits: keep the patch's added lines; it mostly adds code next to Curbox's own (new settings fields, `UNLOCK_GAP` branches, the gap checks in `AppBlocker` and `WarningActivity`)
 3. Run `git add <file>`, then `git rebase --continue`.
 4. Run the script again with the same arguments.
 
@@ -108,7 +121,7 @@ git add patches/<name>.patch && git commit -m "Patch for Curbox 7" && git push
 
 1. In `curbox-android`, run `git switch patch/<name>`.
 2. Edit the files.
-3. Grayscale: run `./gradlew testFullDebugUnitTest --tests "*GrayscaleOwnership*"`. Firefox: run `./gradlew assembleFdroidDebug`.
+3. Grayscale: run `./gradlew testFullDebugUnitTest --tests "*GrayscaleOwnership*"`. Other patches: run `./gradlew assembleFdroidDebug`.
 4. Run `git commit -a --amend`. Each patch must stay **one** commit.
 5. Run `scripts/refresh-patch.sh ../curbox-android <current version> <name>`.
 6. Do the three printed steps, then run the workflow with **force** ticked.
@@ -186,6 +199,7 @@ What a backup does **not** carry, in either app:
 .github/workflows/build.yml   the build (manual + daily)
 patches/firefox-url-rescan.patch   the Firefox patch, from curbox-android branch patch/firefox-url-rescan
 patches/grayscale.patch            the grayscale patch, from curbox-android branch patch/grayscale
+patches/unlock-gap.patch           the unlock waits patch, from curbox-android branch patch/unlock-gap
 scripts/refresh-patch.sh           moves one patch onto a new Curbox release and re-exports it
 ```
 

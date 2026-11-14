@@ -3,7 +3,7 @@
 #
 # Usage:  scripts/refresh-patch.sh <path to curbox-android checkout> <release tag, e.g. 7> [patch name]
 #
-# Patch names: grayscale (default), firefox-url-rescan.
+# Patch names: grayscale (default), firefox-url-rescan, unlock-gap.
 # Each patch lives as ONE commit on branch patch/<name> in the curbox-android checkout.
 # If the rebase stops on a conflict: fix the files, `git add` them, `git rebase --continue`,
 # then run this script again with the same arguments.
