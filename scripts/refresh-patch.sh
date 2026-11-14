@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
-# Moves the grayscale patch onto a new Curbox release and re-exports patches/grayscale.patch.
+# Moves one patch onto a new Curbox release and re-exports patches/<name>.patch.
 #
-# Usage:  scripts/refresh-patch.sh <path to curbox-android checkout> <release tag, e.g. 7>
+# Usage:  scripts/refresh-patch.sh <path to curbox-android checkout> <release tag, e.g. 7> [patch name]
 #
-# The patch lives as ONE commit on branch patch/grayscale in the curbox-android checkout.
+# Patch names: grayscale (default), firefox-url-rescan.
+# Each patch lives as ONE commit on branch patch/<name> in the curbox-android checkout.
 # If the rebase stops on a conflict: fix the files, `git add` them, `git rebase --continue`,
 # then run this script again with the same arguments.
 set -euo pipefail
 
 CURBOX="${1:?path to curbox-android checkout}"
 TAG="${2:?release tag, e.g. 7}"
+NAME="${3:-grayscale}"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 UPSTREAM="https://github.com/curbox-app/curbox-android"
-BRANCH="patch/grayscale"
+BRANCH="patch/$NAME"
 
 cd "$CURBOX"
 
@@ -38,13 +40,18 @@ if [ "$(git rev-list --count "refs/tags/$TAG..HEAD")" != "1" ]; then
   exit 1
 fi
 
-echo "Running the grayscale tests..."
-./gradlew -q testFullDebugUnitTest --tests "*GrayscaleOwnership*"
+if [ "$NAME" = "grayscale" ]; then
+  echo "Running the grayscale tests..."
+  ./gradlew -q testFullDebugUnitTest --tests "*GrayscaleOwnership*"
+else
+  echo "Building the fdroid flavor..."
+  ./gradlew -q assembleFdroidDebug
+fi
 
-git format-patch -1 HEAD --stdout > "$HERE/patches/grayscale.patch"
-echo "Updated $HERE/patches/grayscale.patch"
+git format-patch -1 HEAD --stdout > "$HERE/patches/$NAME.patch"
+echo "Updated $HERE/patches/$NAME.patch"
 echo
 echo "Next:"
 echo "  1. git -C \"$CURBOX\" push --force-with-lease origin $BRANCH"
-echo "  2. Commit and push patches/grayscale.patch in $HERE"
+echo "  2. Commit and push patches/$NAME.patch in $HERE"
 echo "  3. Run the 'Build patched Curbox' workflow with release $TAG"

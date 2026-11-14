@@ -1,6 +1,9 @@
 # curbox-patcher
 
-Builds [Curbox](https://github.com/curbox-app/curbox-android) releases (fdroid flavor) with one extra patch: **Curbox only switches off a grayscale filter it switched on itself.** Filters that you or another app (such as GrayScaler+) turn on are left alone. With no grayscale groups, or all groups disabled, Curbox never changes the grayscale setting.
+Builds [Curbox](https://github.com/curbox-app/curbox-android) releases (fdroid flavor) with two extra patches:
+
+- **Grayscale: Curbox only switches off a grayscale filter it switched on itself.** Filters that you or another app (such as GrayScaler+) turn on are left alone. With no grayscale groups, or all groups disabled, Curbox never changes the grayscale setting.
+- **Firefox: links opened from another app are checked right away.** In stock Curbox, a link opened in Firefox from a text or chat showed its first page unblocked, and the block only came on the first tap inside the page.
 
 Unofficial build, not made by the Curbox developers. Supports Curbox **6 and later** (there was no release 5).
 
@@ -21,17 +24,19 @@ Daily at 09:00 UTC, or when you press "Run workflow"
 1. Find the Curbox release to build ("latest" asks GitHub for the newest one)
 2. Already built "<version>-grayscale"?  yes -> stop (unless "force" is ticked)
 3. Download the official Curbox source code for that release
-4. Apply patches/grayscale.patch
-5. Run the patch's unit tests
+4. Apply every patches/*.patch, in name order
+5. Run the grayscale patch's unit tests
 6. Build the fdroid release APK and sign it with the PERSONAL key
 7. Check the signer matches PERSONAL in android-apps/apps.json (stops if not)
 8. Publish release "<version>-grayscale" here
 9. If it is the newest Curbox release, also replace Curbox.apk on the app hub
 ```
 
-The patch is a list of edits, like "in this file, replace this line with that one." Each new Curbox release gets a fresh copy of the official code, and the edits are applied on top. Applying only fails when Curbox itself changed the same lines the patch edits.
+A patch is a list of edits, like "in this file, replace this line with that one." Each new Curbox release gets a fresh copy of the official code, and the edits are applied on top. Applying only fails when Curbox itself changed the same lines a patch edits. The two patches touch different files, so they never conflict with each other.
 
-### What the patch changes
+The release name stays `<version>-grayscale` for both patches, so older releases, Obtainium and the "already built" check keep working.
+
+### What the grayscale patch changes
 
 - **New file `GrayscaleOwnership.kt`.** It holds the rules, with no Android code, and has unit tests:
   - Curbox owns the filter only after it sees the filter turn on following its own request.
@@ -41,6 +46,16 @@ The patch is a list of edits, like "in this file, replace this line with that on
 - **New file `GrayscaleOwner.kt`.** It watches the system grayscale setting and runs those rules. It stores "Curbox owns it" in a folder Android never backs up, so restoring a backup can't bring back an old value.
 - **`GrayScaleFilter.kt` (Curbox's file).** Only 6 lines change: its on/off calls go through `GrayscaleOwner`. Keeping this small is what makes future releases easy to patch.
 - **Known edge case:** if another app turns grayscale on within 10 seconds after a Curbox "on" that failed, Curbox treats that filter as its own.
+
+### What the Firefox patch changes
+
+Only one Curbox file, `trackers/WebsiteUsageTracker.kt`, and no settings or stored data.
+
+- **The bug.** When Firefox opens a link from another app, it fires its screen events before its address bar exists, then goes quiet. Curbox only read the address bar during those events, so it never saw the first page.
+- **The fix.** After each burst of browser events, Curbox reads the address bar again, 0.8 and 2.5 seconds later. A new event restarts the wait. It only reads while that same browser is still on screen.
+- **Why a tree walk.** Firefox draws its address bar with Compose, and Android's "find by id" can't see Compose tags. If that lookup fails, Curbox looks through the top 500 screen elements instead. The bar is around the 30th, so this takes a few milliseconds.
+- **Checked on a phone:** 10 of 10 links opened from outside Firefox were read within about a second. Typed addresses and Chrome work as before.
+- Other supported browsers get the same extra read, which changes nothing when they already reported the address.
 
 ## Patching it yourself
 
@@ -57,40 +72,45 @@ A new Curbox release is built the next morning. Obtainium notifies you, and the 
 
 ### A new Curbox release won't patch
 
-GitHub emails you that the run failed. Its summary lists the conflicting files. On the PC, using Git Bash:
+GitHub emails you that the run failed. Its summary names the patch and lists the conflicting files. On the PC, using Git Bash:
 
 ```bash
 cd ~/Documents/Developer/repos/curbox-patcher
-scripts/refresh-patch.sh ../curbox-android 7        # 7 = the new Curbox release
+scripts/refresh-patch.sh ../curbox-android 7                      # grayscale patch (the default)
+scripts/refresh-patch.sh ../curbox-android 7 firefox-url-rescan   # Firefox patch
 ```
+
+`7` is the new Curbox release. Run it once for each patch that failed.
 
 The script:
 1. downloads Curbox 7
-2. moves your patch (one commit on branch `patch/grayscale` in `curbox-android`) on top of it
-3. runs the tests
-4. rewrites `patches/grayscale.patch`
+2. moves the patch (one commit on branch `patch/<name>` in `curbox-android`) on top of it
+3. runs the grayscale tests, or builds the fdroid flavor for the Firefox patch
+4. rewrites `patches/<name>.patch`
 
 If it stops on a conflict:
 1. Open each listed file in `curbox-android`.
-2. Keep Curbox's new code, and keep the patch's `grayscaleOwner.…` lines in place of the old `grayscaleControl.enableGrayscale/disableGrayscale` calls.
+2. Keep Curbox's new code and put the patch's lines back:
+   - grayscale: keep the patch's `grayscaleOwner.…` lines in place of the old `grayscaleControl.enableGrayscale/disableGrayscale` calls
+   - Firefox: keep the `scheduleUrlRescan(packageName)` call in `onEvent` and the rescan functions
 3. Run `git add <file>`, then `git rebase --continue`.
 4. Run the script again with the same arguments.
 
 When it finishes, it prints three steps:
 
 ```bash
-git -C ../curbox-android push --force-with-lease origin patch/grayscale
-git add patches/grayscale.patch && git commit -m "Patch for Curbox 7" && git push
+git -C ../curbox-android push --force-with-lease origin patch/<name>
+git add patches/<name>.patch && git commit -m "Patch for Curbox 7" && git push
 # then Actions -> Run workflow -> release 7
 ```
 
-### Change what the patch does
+### Change what a patch does
 
-1. In `curbox-android`, run `git switch patch/grayscale`.
+1. In `curbox-android`, run `git switch patch/<name>`.
 2. Edit the files.
-3. Run `./gradlew testFullDebugUnitTest --tests "*GrayscaleOwnership*"`.
-4. Run `git commit -a --amend`. The patch must stay **one** commit.
-5. Run `scripts/refresh-patch.sh ../curbox-android <current version>`.
+3. Grayscale: run `./gradlew testFullDebugUnitTest --tests "*GrayscaleOwnership*"`. Firefox: run `./gradlew assembleFdroidDebug`.
+4. Run `git commit -a --amend`. Each patch must stay **one** commit.
+5. Run `scripts/refresh-patch.sh ../curbox-android <current version> <name>`.
 6. Do the three printed steps, then run the workflow with **force** ticked.
 
 ### Run the tests locally
@@ -134,7 +154,7 @@ Android can't install an app over a copy signed with a different key, so this ha
 
 ## Backups
 
-A Curbox backup is a plain settings file (`curbox-settings-backup`, format version 1). It holds no app signature or package check, and the patch doesn't change any settings. So a backup made in one app restores in the other, as long as both are the same Curbox version. Restoring is only offered during onboarding.
+A Curbox backup is a plain settings file (`curbox-settings-backup`, format version 1). It holds no app signature or package check, and neither patch changes any settings. So a backup made in one app restores in the other, as long as both are the same Curbox version. Restoring is only offered during onboarding.
 
 | Backup made in → restored into | Works? |
 | --- | --- |
@@ -164,10 +184,11 @@ What a backup does **not** carry, in either app:
 
 ```
 .github/workflows/build.yml   the build (manual + daily)
-patches/grayscale.patch       the patch, exported from curbox-android branch patch/grayscale
-scripts/refresh-patch.sh      moves the patch onto a new Curbox release and re-exports it
+patches/firefox-url-rescan.patch   the Firefox patch, from curbox-android branch patch/firefox-url-rescan
+patches/grayscale.patch            the grayscale patch, from curbox-android branch patch/grayscale
+scripts/refresh-patch.sh           moves one patch onto a new Curbox release and re-exports it
 ```
 
 ## License
 
-GPL-3.0, same as Curbox. The patch source is `patches/grayscale.patch`.
+GPL-3.0, same as Curbox. The patch sources are the files in `patches/`.

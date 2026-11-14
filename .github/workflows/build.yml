@@ -86,7 +86,7 @@ jobs:
           git clone --quiet "https://github.com/$UPSTREAM.git" curbox
           git -C curbox checkout --quiet "refs/tags/$TAG"
 
-      - name: Apply grayscale patch
+      - name: Apply patches
         if: steps.rel.outputs.skip == 'false'
         working-directory: curbox
         env:
@@ -94,17 +94,22 @@ jobs:
         run: |
           git config user.name "curbox-patcher builder"
           git config user.email "actions@users.noreply.github.com"
-          if ! git am -3 ../patches/grayscale.patch; then
-            {
-              echo "### The patch no longer applies to Curbox $TAG"
-              echo "Conflicting files:"
-              git diff --name-only --diff-filter=U | sed 's/^/- /'
-              echo ""
-              echo "Fix: run \`scripts/refresh-patch.sh\` locally (see README), push, then run this workflow again."
-            } >> "$GITHUB_STEP_SUMMARY"
-            echo "::error::Patch conflicts with Curbox $TAG. See the job summary."
-            exit 1
-          fi
+          # Every patches/*.patch, in name order. Each one is its own commit, so one failing
+          # patch names itself in the summary.
+          for patch in ../patches/*.patch; do
+            name="$(basename "$patch" .patch)"
+            if ! git am -3 "$patch"; then
+              {
+                echo "### The $name patch no longer applies to Curbox $TAG"
+                echo "Conflicting files:"
+                git diff --name-only --diff-filter=U | sed 's/^/- /'
+                echo ""
+                echo "Fix: run \`scripts/refresh-patch.sh <curbox-android> $TAG $name\` locally (see README), push, then run this workflow again."
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::The $name patch conflicts with Curbox $TAG. See the job summary."
+              exit 1
+            fi
+          done
 
       - name: Set up JDK 21
         if: steps.rel.outputs.skip == 'false'
@@ -176,10 +181,14 @@ jobs:
           VERSION_CODE="$(grep -m1 -E '^[[:space:]]*versionCode[[:space:]]*=' curbox/app/build.gradle.kts | tr -dc '0-9')"
           CHANGELOG="curbox/fastlane/metadata/android/en-US/changelogs/${VERSION_CODE}.txt"
           {
-            echo "Curbox $TAG (fdroid) with the grayscale ownership patch."
+            echo "Curbox $TAG (fdroid) with two patches:"
             echo ""
-            echo "Curbox only switches off a grayscale filter it switched on itself, so other apps"
-            echo "(e.g. GrayScaler+) keep control. Upstream: https://github.com/$UPSTREAM/releases/tag/$TAG"
+            echo "- Grayscale: Curbox only switches off a grayscale filter it switched on itself, so other"
+            echo "  apps (e.g. GrayScaler+) keep control."
+            echo "- Firefox: a link opened in Firefox from another app is checked against keyword groups"
+            echo "  right away, not only after the first tap on the page."
+            echo ""
+            echo "Upstream: https://github.com/$UPSTREAM/releases/tag/$TAG"
             echo ""
             echo "---"
             echo ""
@@ -213,7 +222,7 @@ jobs:
           fi
           cp "$SRC" Curbox.apk
           title="$NAME $OUT"
-          notes="Built by CI from ${GITHUB_REPOSITORY}@${GITHUB_SHA::7}: Curbox ${OUT%-grayscale} with the grayscale patch, on $(date -u '+%Y-%m-%d %H:%M') UTC."
+          notes="Built by CI from ${GITHUB_REPOSITORY}@${GITHUB_SHA::7}: Curbox ${OUT%-grayscale} with the grayscale and Firefox patches, on $(date -u '+%Y-%m-%d %H:%M') UTC."
           if gh release view "$TAG" --repo "$HUB" > /dev/null 2>&1; then
             gh release upload "$TAG" Curbox.apk --repo "$HUB" --clobber
             gh release edit "$TAG" --repo "$HUB" --title "$title" --notes "$notes"
