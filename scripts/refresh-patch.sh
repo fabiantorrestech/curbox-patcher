@@ -54,4 +54,5 @@ echo
 echo "Next:"
 echo "  1. git -C \"$CURBOX\" push --force-with-lease origin $BRANCH"
 echo "  2. Commit and push patches/$NAME.patch in $HERE"
-echo "  3. Run the 'Build patched Curbox' workflow with release $TAG"
+echo "  3. Run the 'Build patched Curbox' workflow with release $TAG, or wait for the daily check"
+echo "     (a changed patch set gets a new release name, so it builds without force)"

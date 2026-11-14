@@ -1,4 +1,4 @@
-From 22b4160caba91324f4b6b014a49a2a6b5a9b611c Mon Sep 17 00:00:00 2001
+From a711697d259e8f65af1ecd177abc78fd5cf260fe Mon Sep 17 00:00:00 2001
 From: fab <faibiantorrestech@gmail.com>
 Date: Sat, 14 Nov 2026 02:17:34 -0600
 Subject: [PATCH] feat(app blocker): growing wait between unlocks and emergency
@@ -14,50 +14,63 @@ wait, limits and challenges, a set number of times per day. It does not
 grow the wait.
 
 Gap state lives in the app blocker service process. The day end times
-and password are a new gated setting (UNLOCK_GAP), so weaker changes
-wait out the settings change delay.
+(UNLOCK_GAP) and the emergency password with its daily count
+(EMERGENCY_UNLOCK) are two separate gated settings, so weaker changes
+wait out the settings change delay and a stricter change to one (such as
+removing the password) applies right away even while the other has a
+change waiting. A data migration splits a pending UNLOCK_GAP change saved
+by an earlier build of this patch, which held the whole config, into the
+two fields.
+
+A wait never runs past the next day end, day ends are set as wall clock
+times so daylight saving nights do not move them, and the share sheet and
+permission dialog no longer end an "on each open" unlock.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01AeXNKkBfqarSMLZWk676Bs
 ---
- .../neth/iecal/curbox/blockers/AppBlocker.kt  | 101 ++++++++-
+ .../neth/iecal/curbox/blockers/AppBlocker.kt  | 110 ++++++++-
  .../neth/iecal/curbox/data/models/Settings.kt |   3 +-
- .../data/models/SettingsChangeDelayConfig.kt  |   3 +-
- .../curbox/data/models/UnlockGapConfig.kt     |  66 ++++++
+ .../data/models/SettingsChangeDelayConfig.kt  |   5 +-
+ .../curbox/data/models/UnlockGapConfig.kt     |  93 ++++++++
  .../curbox/data/models/WarningScreenConfig.kt |   5 +
+ .../hardcoded/TransientSystemPackages.kt      |  15 ++
  .../curbox/ui/activity/FragmentActivity.kt    |   2 +
- .../curbox/ui/activity/WarningActivity.kt     | 124 +++++++++-
+ .../curbox/ui/activity/WarningActivity.kt     | 126 +++++++++-
  .../main/reducers/ReducersFragment.kt         |   8 +
- .../reducers/advanced/UnlockGapFragment.kt    | 214 ++++++++++++++++++
+ .../reducers/advanced/UnlockGapFragment.kt    | 221 ++++++++++++++++++
  .../shared/WarningConfigFormController.kt     |  72 +++++-
- .../java/neth/iecal/curbox/utils/DataStore.kt |   9 +
- .../curbox/utils/RestrictionComparator.kt     |  24 +-
+ .../java/neth/iecal/curbox/utils/DataStore.kt |  89 ++++++-
+ .../curbox/utils/RestrictionComparator.kt     |  29 ++-
  .../iecal/curbox/utils/SettingsBackupCodec.kt |   6 +
- .../curbox/utils/SettingsChangeDelayUtils.kt  |   1 +
+ .../curbox/utils/SettingsChangeDelayUtils.kt  |   2 +
  .../res/layout/dialog_warning_overlay.xml     |  20 ++
- app/src/main/res/layout/fragment_reducers.xml |  63 ++++++
+ app/src/main/res/layout/fragment_reducers.xml |  63 +++++
  .../main/res/layout/fragment_unlock_gap.xml   | 174 ++++++++++++++
  .../res/layout/fragment_warning_config.xml    | 100 ++++++++
- app/src/main/res/values/strings.xml           |  34 +++
- 19 files changed, 1023 insertions(+), 6 deletions(-)
+ app/src/main/res/values/strings.xml           |  35 +++
+ 20 files changed, 1171 insertions(+), 7 deletions(-)
  create mode 100644 app/src/main/java/neth/iecal/curbox/data/models/UnlockGapConfig.kt
+ create mode 100644 app/src/main/java/neth/iecal/curbox/hardcoded/TransientSystemPackages.kt
  create mode 100644 app/src/main/java/neth/iecal/curbox/ui/fragments/main/reducers/advanced/UnlockGapFragment.kt
  create mode 100644 app/src/main/res/layout/fragment_unlock_gap.xml
 
 diff --git a/app/src/main/java/neth/iecal/curbox/blockers/AppBlocker.kt b/app/src/main/java/neth/iecal/curbox/blockers/AppBlocker.kt
-index 9fd9ce99..33860d84 100644
+index 9fd9ce99..da9b3b0b 100644
 --- a/app/src/main/java/neth/iecal/curbox/blockers/AppBlocker.kt
 +++ b/app/src/main/java/neth/iecal/curbox/blockers/AppBlocker.kt
-@@ -22,6 +22,8 @@ import neth.iecal.curbox.R
+@@ -22,7 +22,10 @@ import neth.iecal.curbox.R
  import neth.iecal.curbox.data.models.AppBlockerWarningScreenConfig
  import neth.iecal.curbox.data.models.AppGroupConfig
  import neth.iecal.curbox.data.models.AppUsageConfig
 +import neth.iecal.curbox.data.models.UnlockGapConfig
 +import neth.iecal.curbox.data.models.UnlockGapSchedule
  import neth.iecal.curbox.data.models.upgradeLegacyAppGroupConfigs
++import neth.iecal.curbox.hardcoded.TRANSIENT_SYSTEM_PACKAGES
  import neth.iecal.curbox.services.BaseBlockingService
  import neth.iecal.curbox.ui.activity.WarningActivity
-@@ -54,6 +56,13 @@ class AppBlocker : BaseBlocker() {
+ import neth.iecal.curbox.utils.AppSuspendHelper
+@@ -54,6 +57,13 @@ class AppBlocker : BaseBlocker() {
          const val INTENT_ACTION_WARNING_SCREEN_VISIBILITY =
              "neth.iecal.curbox.appblocker.warning_screen_visibility"
          const val EXTRA_WARNING_SCREEN_VISIBLE = "warning_screen_visible"
@@ -71,7 +84,7 @@ index 9fd9ce99..33860d84 100644
          private const val TARGET_EVENTS_MASK = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
      }
  
-@@ -76,6 +85,9 @@ class AppBlocker : BaseBlocker() {
+@@ -76,6 +86,9 @@ class AppBlocker : BaseBlocker() {
      // Holds the warning config last shown per group, used for the cooldown intent's default duration.
      private val appBlockerWarningScrnConfgs = ConcurrentHashMap<String, AppBlockerWarningScreenConfig>()
  
@@ -81,7 +94,20 @@ index 9fd9ce99..33860d84 100644
      private lateinit var usageStats : UsageStatsHelper
      private var lastPackage = ""
      private lateinit var service: BaseBlockingService
-@@ -204,7 +216,10 @@ class AppBlocker : BaseBlocker() {
+@@ -109,6 +122,12 @@ class AppBlocker : BaseBlocker() {
+             return
+         }
+ 
++        // A share sheet or permission dialog opened from an app is not leaving it,
++        // so it must not end that app's on each open unlock. Groups that list one still apply.
++        if (packageName in TRANSIENT_SYSTEM_PACKAGES && !blockedAppsList.containsKey(packageName)) {
++            return
++        }
++
+         clearFinishedOnEachOpenSessions(packageName)
+ 
+         val now = System.currentTimeMillis()
+@@ -204,7 +223,10 @@ class AppBlocker : BaseBlocker() {
              .map(AppGroupEntry::groupId)
              .distinct()
              .filter(cooldownGroupsList::containsKey)
@@ -93,7 +119,7 @@ index 9fd9ce99..33860d84 100644
      }
  
      // THIS IS EXPORTED HERE INTENTIONALLY. THE APPBLOCKER SERVICE RUNS IN A DIFFERENT PROCESS THAN
-@@ -247,6 +262,7 @@ class AppBlocker : BaseBlocker() {
+@@ -247,6 +269,7 @@ class AppBlocker : BaseBlocker() {
          settingsJob = CoroutineScope(Dispatchers.IO).launch {
              service.dataStoreManager.settings.collectLatest { settings ->
                  Log.d("AppBlocker", "Settings updated, groups count: ${settings.blockedAppGroups.size}")
@@ -101,7 +127,7 @@ index 9fd9ce99..33860d84 100644
  
                  val newBlockedAppsList = ConcurrentHashMap<String, MutableList<AppGroupEntry>>()
                  settings.blockedAppGroups.upgradeLegacyAppGroupConfigs().forEach { group ->
-@@ -312,11 +328,82 @@ class AppBlocker : BaseBlocker() {
+@@ -312,11 +335,84 @@ class AppBlocker : BaseBlocker() {
              currentTimeMillis + durationMillis
          }
  
@@ -158,7 +184,9 @@ index 9fd9ce99..33860d84 100644
 +        if (streak == 0) return 0L
 +        val unlockEnd = prefs.getLong("gap_unlock_end_$groupId", 0L)
 +        val gapMillis = UnlockGapSchedule.gapMinutes(config, streak) * 60_000L
-+        return if (unlockEnd > Long.MAX_VALUE - gapMillis) Long.MAX_VALUE else unlockEnd + gapMillis
++        val gapEnd = if (unlockEnd > Long.MAX_VALUE - gapMillis) Long.MAX_VALUE else unlockEnd + gapMillis
++        // The streak starts over at the day end, so the wait must not run past it
++        return minOf(gapEnd, UnlockGapSchedule.nextDayEndAfter(now, unlockGapConfig))
 +    }
 +
 +    private fun emergencyUnlockTimesSince(dayStart: Long): List<Long> =
@@ -184,7 +212,7 @@ index 9fd9ce99..33860d84 100644
      private fun getUsageLimitForToday(config: AppUsageConfig): Long {
          return if (config.isDailyUniform) {
              config.uniformLimit
-@@ -444,6 +531,15 @@ class AppBlocker : BaseBlocker() {
+@@ -444,6 +540,15 @@ class AppBlocker : BaseBlocker() {
              if (warningConfig.isWarningDialogHidden) return
              isWarningScreenVisible = true
  
@@ -200,7 +228,7 @@ index 9fd9ce99..33860d84 100644
              handler.postDelayed({
                  val dialogIntent = Intent(service, WarningActivity::class.java).apply {
                      flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
-@@ -454,6 +550,9 @@ class AppBlocker : BaseBlocker() {
+@@ -454,6 +559,9 @@ class AppBlocker : BaseBlocker() {
                          "warning_config",
                          Gson().toJson(warningConfig)
                      )
@@ -223,25 +251,27 @@ index 1b1220fe..9e0b2b95 100644
 +    val unlockGapConfig: UnlockGapConfig = UnlockGapConfig()
  )
 diff --git a/app/src/main/java/neth/iecal/curbox/data/models/SettingsChangeDelayConfig.kt b/app/src/main/java/neth/iecal/curbox/data/models/SettingsChangeDelayConfig.kt
-index 8c4c8e63..f5e59c40 100644
+index 8c4c8e63..e55a0fed 100644
 --- a/app/src/main/java/neth/iecal/curbox/data/models/SettingsChangeDelayConfig.kt
 +++ b/app/src/main/java/neth/iecal/curbox/data/models/SettingsChangeDelayConfig.kt
-@@ -16,7 +16,8 @@ enum class GatedSettingsField {
+@@ -16,7 +16,10 @@ enum class GatedSettingsField {
      UI_HIDER,
      APP_USAGE_TRACKING,
      WEBSITE_USAGE_TRACKING,
 -    CHANGE_DELAY
 +    CHANGE_DELAY,
-+    UNLOCK_GAP
++    /** Day end times only. Builds before [EMERGENCY_UNLOCK] stored the whole [UnlockGapConfig] here. */
++    UNLOCK_GAP,
++    EMERGENCY_UNLOCK
  }
  
  /**
 diff --git a/app/src/main/java/neth/iecal/curbox/data/models/UnlockGapConfig.kt b/app/src/main/java/neth/iecal/curbox/data/models/UnlockGapConfig.kt
 new file mode 100644
-index 00000000..d1c56c0b
+index 00000000..fefbcd5d
 --- /dev/null
 +++ b/app/src/main/java/neth/iecal/curbox/data/models/UnlockGapConfig.kt
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,93 @@
 +package neth.iecal.curbox.data.models
 +
 +import java.util.Calendar
@@ -263,28 +293,43 @@ index 00000000..d1c56c0b
 +    /** How many emergency unlocks are allowed between two day ends. */
 +    val emergencyUnlocksPerDay: Int = 1
 +) {
++    fun emergencyUnlockPrefs() = EmergencyUnlockPrefs(emergencyPasswordHash, emergencyUnlocksPerDay)
++
 +    companion object {
 +        const val MAX_DAY_END_MINUTES = 12 * 60 - 1
 +        const val MAX_EMERGENCY_UNLOCKS_PER_DAY = 10
 +    }
 +}
 +
++/**
++ * The day end part of [UnlockGapConfig], gated on its own as [GatedSettingsField.UNLOCK_GAP]
++ * so a pending day end move never holds back a stricter emergency unlock change.
++ */
++data class UnlockGapDayEnds(
++    val dayEndMinutes: List<Int> = List(7) { 0 }
++)
++
++/** The emergency unlock part of [UnlockGapConfig], gated on its own as [GatedSettingsField.EMERGENCY_UNLOCK]. */
++data class EmergencyUnlockPrefs(
++    val emergencyPasswordHash: String = "",
++    val emergencyUnlocksPerDay: Int = 1
++)
++
 +object UnlockGapSchedule {
 +
 +    /** The most recent day end at or before [now]. */
 +    fun lastDayEndAtOrBefore(now: Long, config: UnlockGapConfig): Long {
-+        var latest = Long.MIN_VALUE
 +        // A day end falls on the morning after its weekday, so only the last two weekdays can own it
-+        for (dayOffset in -2..-1) {
-+            val dayEnd = startOfDay(now, dayOffset).apply {
-+                val weekday = get(Calendar.DAY_OF_WEEK) - 1
-+                add(Calendar.DAY_OF_YEAR, 1)
-+                add(Calendar.MINUTE, dayEndMinutesFor(config, weekday))
-+            }.timeInMillis
-+            if (dayEnd <= now && dayEnd > latest) latest = dayEnd
-+        }
-+        return latest
++        return (-2..-1).map { dayEndOfWeekday(now, it, config) }
++            .filter { it <= now }
++            .maxOrNull() ?: Long.MIN_VALUE
 +    }
++
++    /** The first day end after [now]: this morning's if it is still ahead, else tomorrow's. */
++    fun nextDayEndAfter(now: Long, config: UnlockGapConfig): Long =
++        (-1..0).map { dayEndOfWeekday(now, it, config) }
++            .filter { it > now }
++            .minOrNull() ?: Long.MAX_VALUE
 +
 +    /** Gap in minutes after the [unlockNumber]th unlock of the day, counting from 1. */
 +    fun gapMinutes(config: AppBlockerWarningScreenConfig, unlockNumber: Int): Long {
@@ -294,6 +339,18 @@ index 00000000..d1c56c0b
 +        val max = config.unlockGapMaxMn.coerceAtLeast(0).toLong()
 +        return minOf(start + step * (unlockNumber - 1), max)
 +    }
++
++    /**
++     * The day end of the weekday [dayOffset] days from [now], on the following morning. Set as a
++     * wall clock time, so a daylight saving change that night does not move it by an hour.
++     */
++    private fun dayEndOfWeekday(now: Long, dayOffset: Int, config: UnlockGapConfig): Long =
++        startOfDay(now, dayOffset).apply {
++            val minutes = dayEndMinutesFor(config, get(Calendar.DAY_OF_WEEK) - 1)
++            add(Calendar.DAY_OF_YEAR, 1)
++            set(Calendar.HOUR_OF_DAY, minutes / 60)
++            set(Calendar.MINUTE, minutes % 60)
++        }.timeInMillis
 +
 +    private fun dayEndMinutesFor(config: UnlockGapConfig, weekday: Int): Int =
 +        config.dayEndMinutes.getOrElse(weekday) { 0 }.coerceIn(0, UnlockGapConfig.MAX_DAY_END_MINUTES)
@@ -324,6 +381,27 @@ index d355a2aa..ff6d5fdc 100755
  )
  
  class WarningMessagesAdapter : TypeAdapter<List<String>>() {
+diff --git a/app/src/main/java/neth/iecal/curbox/hardcoded/TransientSystemPackages.kt b/app/src/main/java/neth/iecal/curbox/hardcoded/TransientSystemPackages.kt
+new file mode 100644
+index 00000000..d9e57eef
+--- /dev/null
++++ b/app/src/main/java/neth/iecal/curbox/hardcoded/TransientSystemPackages.kt
+@@ -0,0 +1,15 @@
++package neth.iecal.curbox.hardcoded
++
++/**
++ * System screens that open on top of an app for a moment and then return to it: the share
++ * sheet and the permission dialog. The app blocker does not treat switching to one of these as
++ * leaving the app. The file picker is left out because it is also a full Files app.
++ */
++val TRANSIENT_SYSTEM_PACKAGES: Set<String> = setOf(
++    // Share sheet and "open with" chooser (the system resolver before Android 14)
++    "android",
++    "com.android.intentresolver",
++    // Runtime permission dialog
++    "com.google.android.permissioncontroller",
++    "com.android.permissioncontroller",
++)
 diff --git a/app/src/main/java/neth/iecal/curbox/ui/activity/FragmentActivity.kt b/app/src/main/java/neth/iecal/curbox/ui/activity/FragmentActivity.kt
 index c5754b1e..2257999e 100644
 --- a/app/src/main/java/neth/iecal/curbox/ui/activity/FragmentActivity.kt
@@ -345,7 +423,7 @@ index c5754b1e..2257999e 100644
                  }
                  fragment.arguments = intent.extras
 diff --git a/app/src/main/java/neth/iecal/curbox/ui/activity/WarningActivity.kt b/app/src/main/java/neth/iecal/curbox/ui/activity/WarningActivity.kt
-index cef4e4f6..3b476799 100755
+index cef4e4f6..8a4ff8cd 100755
 --- a/app/src/main/java/neth/iecal/curbox/ui/activity/WarningActivity.kt
 +++ b/app/src/main/java/neth/iecal/curbox/ui/activity/WarningActivity.kt
 @@ -19,6 +19,8 @@ import androidx.appcompat.app.AlertDialog
@@ -365,15 +443,16 @@ index cef4e4f6..3b476799 100755
  import neth.iecal.curbox.utils.DataStoreManager
  import neth.iecal.curbox.utils.FocusGoalProgress
  import java.util.Calendar
-@@ -50,6 +53,7 @@ import neth.iecal.curbox.anti_stimulants.MindfulMessage
+@@ -50,6 +53,8 @@ import neth.iecal.curbox.anti_stimulants.MindfulMessage
  class WarningActivity : AppCompatActivity() {
  
      private var proceedTimer: CountDownTimer? = null
 +    private var unlockGapTimer: CountDownTimer? = null
++    private var isProceedHiddenByFocusGoal = false
      private var dialog: AlertDialog? = null
  
      private var vibrator: Vibrator? = null
-@@ -109,6 +113,9 @@ class WarningActivity : AppCompatActivity() {
+@@ -109,6 +114,9 @@ class WarningActivity : AppCompatActivity() {
          )
  
          val targetId = intent.getStringExtra("result_id") ?: ""
@@ -383,7 +462,7 @@ index cef4e4f6..3b476799 100755
          var isProceedLimitExceeded = false
          var timeUntilNextProceedMn = 0L
          var proceedsLeft = -1
-@@ -275,7 +282,37 @@ class WarningActivity : AppCompatActivity() {
+@@ -275,7 +283,37 @@ class WarningActivity : AppCompatActivity() {
                          }
                          binding.proceedSeconds.visibility = View.GONE
                      }
@@ -422,7 +501,7 @@ index cef4e4f6..3b476799 100755
          }
  
          dialog = MaterialAlertDialogBuilder(this)
-@@ -447,6 +484,87 @@ class WarningActivity : AppCompatActivity() {
+@@ -447,6 +485,87 @@ class WarningActivity : AppCompatActivity() {
          }
      }
  
@@ -441,7 +520,7 @@ index cef4e4f6..3b476799 100755
 +            }
 +
 +            override fun onFinish() {
-+                binding.btnProceed.visibility = View.VISIBLE
++                if (!isProceedHiddenByFocusGoal) binding.btnProceed.visibility = View.VISIBLE
 +                proceedTimer?.start()
 +            }
 +        }.start()
@@ -510,7 +589,15 @@ index cef4e4f6..3b476799 100755
      private fun setupAdaptiveMathChallenge(questionCount: Int, startingLevel: Int) {
          val challenge = AdaptiveMathChallenge(
              requiredAnswers = questionCount.coerceIn(
-@@ -707,6 +825,7 @@ class WarningActivity : AppCompatActivity() {
+@@ -637,6 +756,7 @@ class WarningActivity : AppCompatActivity() {
+ 
+     private fun restrictFocusGoal(message: String) {
+         binding.focusGoalStatus.text = message
++        isProceedHiddenByFocusGoal = true
+         binding.btnProceed.visibility = View.GONE
+         binding.btnCancel.setText(R.string.okay)
+     }
+@@ -707,6 +827,7 @@ class WarningActivity : AppCompatActivity() {
          super.onDestroy()
          stopNfcUnlockScan()
          proceedTimer?.cancel()
@@ -518,7 +605,7 @@ index cef4e4f6..3b476799 100755
          mathRetryTimer?.cancel()
          vibrator?.cancel()
          dialog?.dismiss()
-@@ -716,11 +835,13 @@ class WarningActivity : AppCompatActivity() {
+@@ -716,11 +837,13 @@ class WarningActivity : AppCompatActivity() {
          id: String,
          action: String,
          time: Int,
@@ -532,7 +619,7 @@ index cef4e4f6..3b476799 100755
          if (onDelivered == null) {
              sendBroadcast(intent)
              return
-@@ -807,5 +928,6 @@ class WarningActivity : AppCompatActivity() {
+@@ -807,5 +930,6 @@ class WarningActivity : AppCompatActivity() {
          const val MAX_ADAPTIVE_MATH_LEVEL = 10
          const val MIN_FOCUS_GOAL_MINUTES = 15
          const val MAX_FOCUS_GOAL_MINUTES = 24 * 60
@@ -560,10 +647,10 @@ index b2ea98b0..ac887f44 100644
              val intent = Intent(requireContext(), FragmentActivity::class.java).apply {
 diff --git a/app/src/main/java/neth/iecal/curbox/ui/fragments/main/reducers/advanced/UnlockGapFragment.kt b/app/src/main/java/neth/iecal/curbox/ui/fragments/main/reducers/advanced/UnlockGapFragment.kt
 new file mode 100644
-index 00000000..5e3434c0
+index 00000000..68386d86
 --- /dev/null
 +++ b/app/src/main/java/neth/iecal/curbox/ui/fragments/main/reducers/advanced/UnlockGapFragment.kt
-@@ -0,0 +1,214 @@
+@@ -0,0 +1,221 @@
 +package neth.iecal.curbox.ui.fragments.main.reducers.advanced
 +
 +import android.os.Bundle
@@ -587,6 +674,7 @@ index 00000000..5e3434c0
 +import com.google.android.material.timepicker.TimeFormat
 +import kotlinx.coroutines.launch
 +import neth.iecal.curbox.R
++import neth.iecal.curbox.data.models.EmergencyUnlockPrefs
 +import neth.iecal.curbox.data.models.UnlockGapConfig
 +import neth.iecal.curbox.utils.AntiUninstallManager
 +import neth.iecal.curbox.utils.DataStoreManager
@@ -639,10 +727,10 @@ index 00000000..5e3434c0
 +        }
 +
 +        btnEmergencySet.setOnClickListener {
-+            showSetPasswordDialog { hash -> requestUpdate { it.copy(emergencyPasswordHash = hash) } }
++            showSetPasswordDialog { hash -> requestEmergencyUpdate { it.copy(emergencyPasswordHash = hash) } }
 +        }
 +        btnEmergencyRemove.setOnClickListener {
-+            requestUpdate { it.copy(emergencyPasswordHash = "") }
++            requestEmergencyUpdate { it.copy(emergencyPasswordHash = "") }
 +        }
 +        sliderEmergencyPerDay.addOnChangeListener { _, value, _ ->
 +            textEmergencyPerDay.text = getString(R.string.unlock_gap_emergency_per_day, value.toInt())
@@ -653,7 +741,7 @@ index 00000000..5e3434c0
 +            override fun onStopTrackingTouch(slider: Slider) {
 +                val count = slider.value.toInt()
 +                if (count != config.emergencyUnlocksPerDay) {
-+                    requestUpdate { it.copy(emergencyUnlocksPerDay = count) }
++                    requestEmergencyUpdate { it.copy(emergencyUnlocksPerDay = count) }
 +                }
 +            }
 +        })
@@ -670,9 +758,15 @@ index 00000000..5e3434c0
 +        return view
 +    }
 +
-+    private fun requestUpdate(transform: (UnlockGapConfig) -> UnlockGapConfig) {
++    private fun requestDayEndsUpdate(transform: (List<Int>) -> List<Int>) {
 +        viewLifecycleOwner.lifecycleScope.launch {
-+            dataStore.updateUnlockGapConfig(transform)
++            dataStore.updateUnlockGapDayEnds(transform)
++        }
++    }
++
++    private fun requestEmergencyUpdate(transform: (EmergencyUnlockPrefs) -> EmergencyUnlockPrefs) {
++        viewLifecycleOwner.lifecycleScope.launch {
++            dataStore.updateEmergencyUnlock(transform)
 +        }
 +    }
 +
@@ -737,11 +831,11 @@ index 00000000..5e3434c0
 +                Toast.makeText(requireContext(), R.string.unlock_gap_day_end_too_late, Toast.LENGTH_SHORT).show()
 +                return@addOnPositiveButtonClickListener
 +            }
-+            requestUpdate { current ->
-+                val dayEnds = current.dayEndMinutes.toMutableList()
++            requestDayEndsUpdate { current ->
++                val dayEnds = current.toMutableList()
 +                while (dayEnds.size < 7) dayEnds.add(0)
 +                dayEnds[weekday] = minutes
-+                current.copy(dayEndMinutes = dayEnds.take(7))
++                dayEnds.take(7)
 +            }
 +        }
 +        picker.show(childFragmentManager, "unlock_gap_day_end")
@@ -897,10 +991,104 @@ index 4a8df8b7..31624210 100644
  }
  
 diff --git a/app/src/main/java/neth/iecal/curbox/utils/DataStore.kt b/app/src/main/java/neth/iecal/curbox/utils/DataStore.kt
-index fb2102a2..c6b921e0 100644
+index fb2102a2..0194e231 100644
 --- a/app/src/main/java/neth/iecal/curbox/utils/DataStore.kt
 +++ b/app/src/main/java/neth/iecal/curbox/utils/DataStore.kt
-@@ -242,6 +242,7 @@ class DataStoreManager(private val context: Context) {
+@@ -10,6 +10,7 @@ import androidx.datastore.core.MultiProcessDataStoreFactory
+ import androidx.datastore.core.Serializer
+ import com.google.gson.Gson
+ import com.google.gson.JsonParseException
++import com.google.gson.JsonParser
+ import com.google.gson.reflect.TypeToken
+ import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.flow.map
+@@ -18,6 +19,7 @@ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.withContext
+ import neth.iecal.curbox.R
+ import neth.iecal.curbox.data.models.AppGroup
++import neth.iecal.curbox.data.models.EmergencyUnlockPrefs
+ import neth.iecal.curbox.data.models.GatedSettingsField
+ import neth.iecal.curbox.data.models.KeywordBlocker
+ import neth.iecal.curbox.data.models.ManualFocusGroup
+@@ -26,6 +28,8 @@ import neth.iecal.curbox.data.models.PomodoroState
+ import neth.iecal.curbox.data.models.Settings
+ import neth.iecal.curbox.data.models.SettingsChangeDelayConfig
+ import neth.iecal.curbox.data.models.SettingsChangeDelayPrefs
++import neth.iecal.curbox.data.models.UnlockGapConfig
++import neth.iecal.curbox.data.models.UnlockGapDayEnds
+ import neth.iecal.curbox.data.models.upgradeLegacyAppGroupConfigs
+ import neth.iecal.curbox.data.models.upgradeLegacyKeywordGroupConfigs
+ import neth.iecal.curbox.data.models.upgradeLegacyConfig
+@@ -121,6 +125,56 @@ private class ScheduledUsageConfigMigration(
+     }.getOrNull()
+ }
+ 
++/**
++ * Builds before [GatedSettingsField.EMERGENCY_UNLOCK] stored the whole [UnlockGapConfig] in a
++ * pending UNLOCK_GAP change. UNLOCK_GAP now applies only the day ends, so a waiting password
++ * or count change is moved to its own pending EMERGENCY_UNLOCK change with the same deadline.
++ */
++private class UnlockGapPendingSplitMigration(
++    private val gson: Gson
++) : DataMigration<Settings> {
++    override suspend fun shouldMigrate(currentData: Settings): Boolean =
++        currentData.settingsChangeDelayConfig2.pendingChanges.any(::holdsWholeConfig)
++
++    override suspend fun migrate(currentData: Settings): Settings {
++        val pending = currentData.settingsChangeDelayConfig2.pendingChanges
++        val current = currentData.unlockGapConfig
++        val hasEmergencyPending = pending.any { it.field == GatedSettingsField.EMERGENCY_UNLOCK.name }
++        val upgraded = pending.flatMap { change ->
++            if (!holdsWholeConfig(change)) return@flatMap listOf(change)
++            runCatching {
++                val requested = gson.fromJson(change.newValueJson, UnlockGapConfig::class.java)
++                val split = mutableListOf<PendingSettingsChange>()
++                if (requested.dayEndMinutes != current.dayEndMinutes) {
++                    split.add(change.copy(
++                        newValueJson = gson.toJson(UnlockGapDayEnds(requested.dayEndMinutes))
++                    ))
++                }
++                val emergency = requested.emergencyUnlockPrefs()
++                if (!hasEmergencyPending && emergency != current.emergencyUnlockPrefs()) {
++                    split.add(change.copy(
++                        field = GatedSettingsField.EMERGENCY_UNLOCK.name,
++                        newValueJson = gson.toJson(emergency)
++                    ))
++                }
++                split.toList()
++            }.getOrDefault(emptyList())
++        }
++        return currentData.copy(
++            settingsChangeDelayConfig2 = currentData.settingsChangeDelayConfig2.copy(
++                pendingChanges = upgraded
++            )
++        )
++    }
++
++    override suspend fun cleanUp() = Unit
++
++    private fun holdsWholeConfig(change: PendingSettingsChange): Boolean =
++        change.field == GatedSettingsField.UNLOCK_GAP.name && runCatching {
++            JsonParser.parseString(change.newValueJson).asJsonObject.has("emergencyPasswordHash")
++        }.getOrDefault(false)
++}
++
+ class DataStoreManager(private val context: Context) {
+     private val gson = Gson()
+ 
+@@ -141,7 +195,10 @@ class DataStoreManager(private val context: Context) {
+                         type = Settings::class.java,
+                         defaultValue = Settings()
+                     ),
+-                    migrations = listOf(ScheduledUsageConfigMigration(gson)),
++                    migrations = listOf(
++                        ScheduledUsageConfigMigration(gson),
++                        UnlockGapPendingSplitMigration(gson)
++                    ),
+                     produceFile = { File(context.applicationContext.filesDir, "datastore/settings.json") }
+                 ).also { INSTANCE = it }
+             }
+@@ -242,6 +299,7 @@ class DataStoreManager(private val context: Context) {
                  uiHiderConfig = current.uiHiderConfig,
                  nextWebsiteRecheckTime = current.nextWebsiteRecheckTime,
                  settingsChangeDelayConfig2 = delayConfig,
@@ -908,37 +1096,58 @@ index fb2102a2..c6b921e0 100644
              )
  
              for (field in GatedSettingsField.values()) {
-@@ -389,6 +390,10 @@ class DataStoreManager(private val context: Context) {
+@@ -389,6 +447,18 @@ class DataStoreManager(private val context: Context) {
          updateGated(GatedSettingsField.MINDFUL_MESSAGES) { config }
      }
  
-+    suspend fun updateUnlockGapConfig(transform: (neth.iecal.curbox.data.models.UnlockGapConfig) -> neth.iecal.curbox.data.models.UnlockGapConfig) {
-+        updateGated(GatedSettingsField.UNLOCK_GAP) { transform(it.unlockGapConfig) }
++    suspend fun updateUnlockGapDayEnds(transform: (List<Int>) -> List<Int>) {
++        updateGated(GatedSettingsField.UNLOCK_GAP) {
++            UnlockGapDayEnds(transform(it.unlockGapConfig.dayEndMinutes))
++        }
++    }
++
++    suspend fun updateEmergencyUnlock(transform: (EmergencyUnlockPrefs) -> EmergencyUnlockPrefs) {
++        updateGated(GatedSettingsField.EMERGENCY_UNLOCK) {
++            transform(it.unlockGapConfig.emergencyUnlockPrefs())
++        }
 +    }
 +
      suspend fun updateUiHiderConfig(transform: (neth.iecal.curbox.data.models.UiHiderConfig) -> neth.iecal.curbox.data.models.UiHiderConfig) {
          updateGated(GatedSettingsField.UI_HIDER) { transform(it.uiHiderConfig.normalized()) }
      }
-@@ -703,6 +708,9 @@ class DataStoreManager(private val context: Context) {
+@@ -703,6 +773,21 @@ class DataStoreManager(private val context: Context) {
                          requireTamperProtectionOff = prefs.requireTamperProtectionOff
                      ))
                  }
-+                GatedSettingsField.UNLOCK_GAP -> settings.copy(
-+                    unlockGapConfig = gson.fromJson(valueJson, neth.iecal.curbox.data.models.UnlockGapConfig::class.java)
-+                )
++                // Each applies only its own part, so the two never overwrite each other. Older
++                // pending UNLOCK_GAP values hold a whole UnlockGapConfig; the extra keys are ignored.
++                GatedSettingsField.UNLOCK_GAP -> {
++                    val dayEnds = gson.fromJson(valueJson, UnlockGapDayEnds::class.java)
++                    settings.copy(unlockGapConfig = settings.unlockGapConfig.copy(
++                        dayEndMinutes = dayEnds.dayEndMinutes
++                    ))
++                }
++                GatedSettingsField.EMERGENCY_UNLOCK -> {
++                    val emergency = gson.fromJson(valueJson, EmergencyUnlockPrefs::class.java)
++                    settings.copy(unlockGapConfig = settings.unlockGapConfig.copy(
++                        emergencyPasswordHash = emergency.emergencyPasswordHash,
++                        emergencyUnlocksPerDay = emergency.emergencyUnlocksPerDay
++                    ))
++                }
              }
          }.getOrNull()
      }
-@@ -729,6 +737,7 @@ class DataStoreManager(private val context: Context) {
+@@ -729,6 +814,8 @@ class DataStoreManager(private val context: Context) {
                      requireTamperProtectionOff =
                          settings.settingsChangeDelayConfig2.requireTamperProtectionOff,
                  )
-+                GatedSettingsField.UNLOCK_GAP -> settings.unlockGapConfig
++                GatedSettingsField.UNLOCK_GAP -> UnlockGapDayEnds(settings.unlockGapConfig.dayEndMinutes)
++                GatedSettingsField.EMERGENCY_UNLOCK -> settings.unlockGapConfig.emergencyUnlockPrefs()
              }
              gson.toJson(value)
          }.getOrNull()
 diff --git a/app/src/main/java/neth/iecal/curbox/utils/RestrictionComparator.kt b/app/src/main/java/neth/iecal/curbox/utils/RestrictionComparator.kt
-index 5112afc4..db185ff3 100755
+index 5112afc4..96f921ad 100755
 --- a/app/src/main/java/neth/iecal/curbox/utils/RestrictionComparator.kt
 +++ b/app/src/main/java/neth/iecal/curbox/utils/RestrictionComparator.kt
 @@ -17,6 +17,7 @@ import neth.iecal.curbox.data.models.Settings
@@ -949,33 +1158,38 @@ index 5112afc4..db185ff3 100755
  import neth.iecal.curbox.data.models.upgradeLegacyConfig
  import neth.iecal.curbox.hardcoded.allScripts
  
-@@ -59,12 +60,25 @@ object RestrictionComparator {
+@@ -59,12 +60,30 @@ object RestrictionComparator {
                      !current.isWebsiteUsageTrackingEnabled || proposed.isWebsiteUsageTrackingEnabled
                  GatedSettingsField.CHANGE_DELAY ->
                      changeDelay(current.settingsChangeDelayConfig2, proposed.settingsChangeDelayConfig2)
 +                GatedSettingsField.UNLOCK_GAP ->
-+                    unlockGap(current.unlockGapConfig, proposed.unlockGapConfig)
++                    unlockGapDayEnds(current.unlockGapConfig, proposed.unlockGapConfig)
++                GatedSettingsField.EMERGENCY_UNLOCK ->
++                    emergencyUnlock(current.unlockGapConfig, proposed.unlockGapConfig)
              }
          } catch (e: Exception) {
              false
          }
      }
  
-+    fun unlockGap(old: UnlockGapConfig, new: UnlockGapConfig): Boolean {
++    fun unlockGapDayEnds(old: UnlockGapConfig, new: UnlockGapConfig): Boolean {
 +        // Moving a day end changes when streaks reset, which can't be proven stricter
-+        val dayEndsOk = old.dayEndMinutes == new.dayEndMinutes
++        return old.dayEndMinutes == new.dayEndMinutes
++    }
++
++    fun emergencyUnlock(old: UnlockGapConfig, new: UnlockGapConfig): Boolean {
 +        // A new or changed password is a new way past the block; removing it is stricter
 +        val passwordOk = new.emergencyPasswordHash.isEmpty() ||
 +            new.emergencyPasswordHash == old.emergencyPasswordHash
 +        val emergencyCountOk = new.emergencyPasswordHash.isEmpty() ||
 +            new.emergencyUnlocksPerDay <= old.emergencyUnlocksPerDay
-+        return dayEndsOk && passwordOk && emergencyCountOk
++        return passwordOk && emergencyCountOk
 +    }
 +
      fun changeDelay(old: SettingsChangeDelayConfig, new: SettingsChangeDelayConfig): Boolean {
          // Off or set to no wait means the timer holds nothing, so any change to it passes
          val timeOk = !old.isEnabled || old.delayMinutes <= 0 ||
-@@ -320,6 +334,14 @@ object RestrictionComparator {
+@@ -320,6 +339,14 @@ object RestrictionComparator {
          val dialogHiddenOk = !o.isWarningDialogHidden || n.isWarningDialogHidden
          val proceedDelayOk = n.proceedDelayInSecs >= o.proceedDelayInSecs
          val vibrateOk = !o.vibrateAndIncBrightness || n.vibrateAndIncBrightness
@@ -990,7 +1204,7 @@ index 5112afc4..db185ff3 100755
          val proceedLimitOk = when {
              o.proceedLimitEnabled && !n.proceedLimitEnabled -> false
              o.proceedLimitEnabled && n.proceedLimitEnabled ->
-@@ -359,7 +381,7 @@ object RestrictionComparator {
+@@ -359,7 +386,7 @@ object RestrictionComparator {
  
          return onEachOpenOk && cooldownOk && dynamicIntervalOk &&
              proceedDisabledOk && dialogHiddenOk &&
@@ -1031,14 +1245,15 @@ index 66e2d135..8bae3f32 100644
          require(settings.reelCounterOverlayConfig.textSize.isFinite() && settings.reelCounterOverlayConfig.textSize > 0f)
          require(settings.mindfulMessageConfig.positionX.isFinite() && settings.mindfulMessageConfig.positionY.isFinite())
 diff --git a/app/src/main/java/neth/iecal/curbox/utils/SettingsChangeDelayUtils.kt b/app/src/main/java/neth/iecal/curbox/utils/SettingsChangeDelayUtils.kt
-index 8256652e..1cea9997 100644
+index 8256652e..674f253b 100644
 --- a/app/src/main/java/neth/iecal/curbox/utils/SettingsChangeDelayUtils.kt
 +++ b/app/src/main/java/neth/iecal/curbox/utils/SettingsChangeDelayUtils.kt
-@@ -63,6 +63,7 @@ object SettingsChangeDelayUtils {
+@@ -63,6 +63,8 @@ object SettingsChangeDelayUtils {
                  GatedSettingsField.UI_HIDER -> R.string.change_delay_field_ui_hider
                  GatedSettingsField.APP_USAGE_TRACKING -> R.string.app_usage_tracking
                  GatedSettingsField.WEBSITE_USAGE_TRACKING -> R.string.website_usage_tracking
 +                GatedSettingsField.UNLOCK_GAP -> R.string.change_delay_field_unlock_gap
++                GatedSettingsField.EMERGENCY_UNLOCK -> R.string.change_delay_field_emergency_unlock
                  GatedSettingsField.CHANGE_DELAY, null -> R.string.change_delay_field_change_delay
              }
          )
@@ -1444,10 +1659,10 @@ index 0467b186..092d28f6 100755
                          android:id="@+id/switch_vibrate_brightness"
                          style="@style/TextAppearance.Material3.TitleSmall"
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index 31d32bc9..220ea698 100755
+index 31d32bc9..215cb831 100755
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
-@@ -2008,4 +2008,38 @@
+@@ -2008,4 +2008,39 @@
      <string name="onboarding_finish_failed">Could not finish setup. Please try again.</string>
      <string name="usage_select_background_art">Select background art</string>
      <string name="usage_background_art_random">Random</string>
@@ -1469,7 +1684,8 @@ index 31d32bc9..220ea698 100755
 +    <string name="warning_emergency_unlock_title">Emergency unlock</string>
 +    <string name="warning_emergency_unlock_message">Type your emergency password. This opens the app right away and skips every wait and check.</string>
 +    <string name="warning_emergency_unlock_confirm">Unlock</string>
-+    <string name="change_delay_field_unlock_gap">Unlock waits and emergency unlock</string>
++    <string name="change_delay_field_unlock_gap">Day end for unlock waits</string>
++    <string name="change_delay_field_emergency_unlock">Emergency unlock</string>
 +    <string name="unlock_gap_title">Unlock waits</string>
 +    <string name="unlock_gap_card_subtitle">When your day ends and your emergency password</string>
 +    <string name="unlock_gap_help_popup">App groups can make you wait longer after each unlock. Here you pick when your day ends, so the waits start small again. You can also set an emergency password that unlocks right away.</string>

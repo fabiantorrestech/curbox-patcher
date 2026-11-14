@@ -13,7 +13,7 @@ Unofficial build, not made by the Curbox developers. Supports Curbox **6 and lat
 | Where | Link |
 | --- | --- |
 | App hub (always the newest build) | [Curbox.apk](https://github.com/fabiantorrestech/android-apps/releases/download/curbox/Curbox.apk), also listed on [fabiantorrestech.github.io/android-apps](https://fabiantorrestech.github.io/android-apps/) |
-| Every build, by version | [Releases](https://github.com/fabiantorrestech/curbox-patcher/releases) (`<version>-grayscale`) |
+| Every build, by version | [Releases](https://github.com/fabiantorrestech/curbox-patcher/releases) (`<version>-grayscale-p<patch set>`, e.g. `6-grayscale-p4`) |
 | Automatic updates | In [Obtainium](https://github.com/ImranR98/Obtainium), add `https://github.com/fabiantorrestech/curbox-patcher` |
 
 ## How it works
@@ -23,19 +23,43 @@ Daily at 09:00 UTC, or when you press "Run workflow"
         |
         v
 1. Find the Curbox release to build ("latest" asks GitHub for the newest one)
-2. Already built "<version>-grayscale"?  yes -> stop (unless "force" is ticked)
+2. Already built "<version>-grayscale-p<patch set>"?  yes -> stop (unless "force" is ticked)
 3. Download the official Curbox source code for that release
 4. Apply every patches/*.patch, in name order
 5. Run the grayscale patch's unit tests
 6. Build the fdroid release APK and sign it with the PERSONAL key
 7. Check the signer matches PERSONAL in android-apps/apps.json (stops if not)
-8. Publish release "<version>-grayscale" here
+8. Publish release "<version>-grayscale-p<patch set>" here (an older Curbox version is marked pre-release)
 9. If it is the newest Curbox release, also replace Curbox.apk on the app hub
 ```
 
 A patch is a list of edits, like "in this file, replace this line with that one." Each new Curbox release gets a fresh copy of the official code, and the edits are applied on top. Applying only fails when Curbox itself changed the same lines a patch edits. The patches are applied in name order, each as its own commit, and they apply cleanly together on Curbox 6.
 
-The release name stays `<version>-grayscale` for all patches, so older releases, Obtainium and the "already built" check keep working.
+### Release names
+
+Each release is named `<version>-grayscale-p<patch set>`, for example `6-grayscale-p4`:
+
+- `<version>` is the Curbox release, like `6`.
+- `<patch set>` counts the commits on `main` that changed `patches/`. Any patch change makes it go up by one. That only holds on `main` with its full history, so the workflow refuses to publish from another branch or a shallow checkout. Don't rewrite `main`'s history (force push): a number could repeat, and the build would be skipped as "already built".
+
+Why: Obtainium decides there is an update when the release name changes. It can't use the app's own version, because the patches never change it (Curbox 6 is always `6-fdroid`). So a rebuild under the same name looks like no update at all. A new patch set gets a new name, so:
+
+- Obtainium offers it as an update.
+- The daily check builds it on its own, because that name isn't built yet. No **force** needed.
+- Older releases stay as they are. The first releases, named `6-grayscale`, stay too.
+
+**force** rebuilds the same name in place, so Obtainium won't notice it. Use it only to fix a broken build.
+
+A build of an older Curbox version (for example `6` after `7` is out) is published as a pre-release. Obtainium skips pre-releases by default, so it never offers an older Curbox as an update.
+
+#### One-time check in Obtainium
+
+Releases made before this change were all named `6-grayscale`. Open Curbox in Obtainium, tap the settings (gear) icon, and check:
+
+- **Sort method** (in the GitHub options): **Release date**. That's the default for apps added from the GitHub link. Other sort methods can't tell `6-grayscale` and `6-grayscale-p4` apart and may keep the old one.
+- **Include pre-releases**: off (the default).
+
+Then pull down to check for updates. The first `-p` release shows up as an update even if the APK is the same as the one you have.
 
 ### What the grayscale patch changes
 
@@ -61,10 +85,10 @@ Only one Curbox file, `trackers/WebsiteUsageTracker.kt`, and no settings or stor
 ### What the unlock waits patch changes
 
 - **Per app group** (Configure Warning Screen > Advanced > "Wait longer after each unlock"): first wait, minutes added each time, longest wait. Default 1, 1, 30: waits of 1, 2, 3 … 30 minutes.
-- **The wait starts when the unlock ends.** For a timed unlock that is its end time. For "on each open", it is when you leave the group's apps. During the wait the warning screen shows a countdown and no Proceed button, then the normal wait timer runs.
+- **The wait starts when the unlock ends.** For a timed unlock that is its end time. For "on each open", it is when you leave the group's apps; opening the share sheet or a permission prompt doesn't count as leaving. During the wait the warning screen shows a countdown and no Proceed button, then the normal wait timer runs. A wait always ends by your day end, even if it would be longer.
 - **Reducers > Advanced > Unlock waits** holds the shared settings: when each day ends (per weekday, before noon the next morning, e.g. Friday night ends at 4:00) and the emergency password with how many emergency unlocks you get per day.
 - **Emergency unlock** opens the app for the group's normal time and skips the wait, limits and challenges. It does not make the next wait longer.
-- **Settings change delay:** turning waits off, making them shorter, moving a day end, setting a password or allowing more emergencies count as weaker changes and wait out the delay.
+- **Settings change delay:** turning waits off, making them shorter, moving a day end, setting a password or allowing more emergencies count as weaker changes and wait out the delay. Day ends and the emergency password are separate settings, so a stricter change to one (like removing the password) applies right away even while a day end change is waiting.
 - **Stored data:** new settings fields with defaults (old backups still load). The unlock count lives in the blocker service's own preferences, so it survives a service restart. No database change.
 - **Checked on a phone (Pixel 5, debug build):** waits of 1 then 2 minutes, countdown kept after killing the service, on each open waits start on leaving, wrong password refused, emergency unlock during a wait, day end reset, change delay holds a weaker change.
 
@@ -72,13 +96,13 @@ Only one Curbox file, `trackers/WebsiteUsageTracker.kt`, and no settings or stor
 
 ### Usually: nothing
 
-A new Curbox release is built the next morning. Obtainium notifies you, and the hub link updates on its own.
+A new Curbox release, or a pushed patch change, is built the next morning. Obtainium notifies you, and the hub link updates on its own.
 
 ### Build a specific version now
 
 1. On github.com (desktop site on a phone works), open this repo → **Actions** → **Build patched Curbox** → **Run workflow**.
 2. In **release**, type the version (for example `7`), or leave `latest`.
-3. Tick **force** only to rebuild a version that already exists.
+3. Tick **force** only to rebuild a release that already exists with the same patches (Obtainium won't see it as an update).
 4. Press **Run workflow**. The APK appears under **Releases** after about 5 minutes.
 
 ### A new Curbox release won't patch
@@ -105,7 +129,7 @@ If it stops on a conflict:
 2. Keep Curbox's new code and put the patch's lines back:
    - grayscale: keep the patch's `grayscaleOwner.…` lines in place of the old `grayscaleControl.enableGrayscale/disableGrayscale` calls
    - Firefox: keep the `scheduleUrlRescan(packageName)` call in `onEvent` and the rescan functions
-   - unlock waits: keep the patch's added lines; it mostly adds code next to Curbox's own (new settings fields, `UNLOCK_GAP` branches, the gap checks in `AppBlocker` and `WarningActivity`)
+   - unlock waits: keep the patch's added lines; it mostly adds code next to Curbox's own (new settings fields, `UNLOCK_GAP` and `EMERGENCY_UNLOCK` branches, the gap checks in `AppBlocker` and `WarningActivity`)
 3. Run `git add <file>`, then `git rebase --continue`.
 4. Run the script again with the same arguments.
 
@@ -124,7 +148,7 @@ git add patches/<name>.patch && git commit -m "Patch for Curbox 7" && git push
 3. Grayscale: run `./gradlew testFullDebugUnitTest --tests "*GrayscaleOwnership*"`. Other patches: run `./gradlew assembleFdroidDebug`.
 4. Run `git commit -a --amend`. Each patch must stay **one** commit.
 5. Run `scripts/refresh-patch.sh ../curbox-android <current version> <name>`.
-6. Do the three printed steps, then run the workflow with **force** ticked.
+6. Do the three printed steps. The next daily check builds the new patch set as a new release; to get it now, run the workflow (no **force** needed).
 
 ### Run the tests locally
 
@@ -167,14 +191,17 @@ Android can't install an app over a copy signed with a different key, so this ha
 
 ## Backups
 
-A Curbox backup is a plain settings file (`curbox-settings-backup`, format version 1). It holds no app signature or package check, and neither patch changes any settings. So a backup made in one app restores in the other, as long as both are the same Curbox version. Restoring is only offered during onboarding.
+A Curbox backup is a plain settings file (`curbox-settings-backup`, format version 1). It holds no app signature or package check, so a backup made in one app restores in the other, as long as both are the same Curbox version. Restoring is only offered during onboarding.
+
+The grayscale and Firefox patches add no settings. The unlock waits patch does: each group's waits (on or off, first wait, step, longest wait), the day end times, and the emergency password with its daily count. These are saved in the backup and restore into a patched build. Official Curbox doesn't know them, so it skips them without a warning.
 
 | Backup made in → restored into | Works? |
 | --- | --- |
 | Official Curbox → patched build (same version) | ✅ |
-| Patched build → official Curbox (same version) | ✅ |
+| Patched build → official Curbox (same version) | ✅ but the unlock waits, day ends and emergency password are dropped |
 | Patched build → patched build, or official → official | ✅ |
 | Older Curbox → newer Curbox, while both use backup format 1 | ✅ |
+| Backup from before the unlock waits patch → patched build | ✅ waits start off, day ends at 0:00, no emergency password |
 | Into a Curbox whose backup format number differs | ❌ "Unsupported backup version" |
 | Into a build without the UI hider or grayscale (Play Store flavor) | ✅ but those parts are dropped |
 
@@ -185,7 +212,9 @@ What a backup does **not** carry, in either app:
 | Blocking groups, schedules, keywords, grayscale groups, focus mode and other settings | ✅ |
 | Usage history and statistics | ❌ |
 | Accessibility, Shizuku, device admin and other permissions (grant them again) | ❌ |
-| The patch's "Curbox owns the filter" flag (starts fresh, which is the safe default) | ❌ |
+| Unlock waits and emergency password settings | ✅ (patched builds only) |
+| The grayscale patch's "Curbox owns the filter" flag (starts fresh, which is the safe default) | ❌ |
+| How many unlocks you had today and the running wait (start fresh) | ❌ |
 
 ## Cost
 

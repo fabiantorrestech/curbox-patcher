@@ -8,11 +8,11 @@ on:
         required: true
         default: latest
       force:
-        description: Rebuild even if this release was already built
+        description: Rebuild even if this release was already built with the current patches
         type: boolean
         default: false
   schedule:
-    # Daily check for a new upstream release (09:00 UTC). Builds only when there is one.
+    # Daily check (09:00 UTC). Builds only for a new upstream release or a changed patch set.
     - cron: '0 9 * * *'
 
 permissions:
@@ -35,6 +35,9 @@ jobs:
     steps:
       - name: Checkout this repo
         uses: actions/checkout@v4
+        with:
+          # Full history: the patch set number counts the commits that changed patches/.
+          fetch-depth: 0
 
       - name: Resolve release
         id: rel
@@ -64,15 +67,29 @@ jobs:
             exit 1
           fi
 
-          OUT="${TAG}-grayscale"
+          # A new patch set gets its own release tag, so Obtainium sees it as a new version
+          # (it compares tags, and a re-published tag looks unchanged). The number counts the
+          # commits on main that changed patches/, so it only grows when built from main's full,
+          # never rewritten history. Anything else could reuse a number and skip new patches.
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Releases are built only from main (this run is on $GITHUB_REF). Run the workflow on main."
+            exit 1
+          fi
+          if [ "$(git rev-parse --is-shallow-repository)" != "false" ]; then
+            echo "::error::The checkout is shallow, so the patch set number would be wrong."
+            exit 1
+          fi
+          PATCH_SET="$(git rev-list --count HEAD -- patches/)"
+          OUT="${TAG}-grayscale-p${PATCH_SET}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "out=$OUT" >> "$GITHUB_OUTPUT"
+          echo "patch_set=$PATCH_SET" >> "$GITHUB_OUTPUT"
           # Only the newest upstream release becomes "latest" here, so update apps never downgrade.
           if [ "$TAG" = "$LATEST" ]; then echo "latest=true" >> "$GITHUB_OUTPUT"; else echo "latest=false" >> "$GITHUB_OUTPUT"; fi
 
           if gh release view "$OUT" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 && [ "$INPUT_FORCE" != "true" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Release **$OUT** already exists. Nothing to do (run with *force* to rebuild)." >> "$GITHUB_STEP_SUMMARY"
+            echo "Release **$OUT** already exists (Curbox $TAG, patch set $PATCH_SET). Nothing to do (run with *force* to rebuild it in place)." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
@@ -172,6 +189,7 @@ jobs:
         env:
           TAG: ${{ steps.rel.outputs.tag }}
           OUT: ${{ steps.rel.outputs.out }}
+          PATCH_SET: ${{ steps.rel.outputs.patch_set }}
           SIGNED: ${{ steps.sign.outputs.signedReleaseFile }}
         run: |
           DEST="curbox-${OUT}-fdroid.apk"
@@ -181,7 +199,7 @@ jobs:
           VERSION_CODE="$(grep -m1 -E '^[[:space:]]*versionCode[[:space:]]*=' curbox/app/build.gradle.kts | tr -dc '0-9')"
           CHANGELOG="curbox/fastlane/metadata/android/en-US/changelogs/${VERSION_CODE}.txt"
           {
-            echo "Curbox $TAG (fdroid) with three patches:"
+            echo "Curbox $TAG (fdroid) with three patches (patch set $PATCH_SET):"
             echo ""
             echo "- Grayscale: Curbox only switches off a grayscale filter it switched on itself, so other"
             echo "  apps (e.g. GrayScaler+) keep control."
@@ -206,6 +224,9 @@ jobs:
           body_path: release-notes.md
           files: ${{ steps.apk.outputs.path }}
           make_latest: ${{ steps.rel.outputs.latest }}
+          # A build of an older Curbox is newer by date. Marking it a pre-release keeps Obtainium
+          # (which skips pre-releases by default) from offering it as an update.
+          prerelease: ${{ steps.rel.outputs.latest != 'true' }}
 
       # Same rolling-release step as the other apps' workflows (android-apps ADR 4 and 8).
       # Only the newest upstream release goes to the hub, so its download never goes backwards.
@@ -217,6 +238,7 @@ jobs:
           NAME: Curbox (grayscale patch)
           SRC: ${{ steps.apk.outputs.path }}
           OUT: ${{ steps.rel.outputs.out }}
+          UPSTREAM_TAG: ${{ steps.rel.outputs.tag }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "::warning::APP_HUB_TOKEN missing: not publishing to the hub"
@@ -224,7 +246,7 @@ jobs:
           fi
           cp "$SRC" Curbox.apk
           title="$NAME $OUT"
-          notes="Built by CI from ${GITHUB_REPOSITORY}@${GITHUB_SHA::7}: Curbox ${OUT%-grayscale} with the grayscale, Firefox and unlock waits patches, on $(date -u '+%Y-%m-%d %H:%M') UTC."
+          notes="Built by CI from ${GITHUB_REPOSITORY}@${GITHUB_SHA::7}: Curbox $UPSTREAM_TAG with the grayscale, Firefox and unlock waits patches, on $(date -u '+%Y-%m-%d %H:%M') UTC."
           if gh release view "$TAG" --repo "$HUB" > /dev/null 2>&1; then
             gh release upload "$TAG" Curbox.apk --repo "$HUB" --clobber
             gh release edit "$TAG" --repo "$HUB" --title "$title" --notes "$notes"
