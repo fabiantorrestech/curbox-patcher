@@ -6,7 +6,7 @@ Builds [Curbox](https://github.com/curbox-app/curbox-android) releases (fdroid f
 - **Firefox: links opened from another app are checked right away.** In stock Curbox, a link opened in Firefox from a text or chat showed its first page unblocked, and the block only came on the first tap inside the page.
 - **Unlock waits: a growing wait between app unlocks, plus an emergency password.** After an app group unlock ends, the next unlock waits 1 minute, then 2, then 3 and so on (you pick the numbers per group). The waits start over at your "day end" time, set per weekday. An optional emergency password unlocks right away a few times a day.
 
-Unofficial build, not made by the Curbox developers. Supports Curbox **6 and later** (there was no release 5).
+Unofficial build, not made by the Curbox developers. Supports Curbox **7 and later**. The patches are made against Curbox 7; the builds for Curbox 6 stay under Releases.
 
 ## Download
 
@@ -23,17 +23,17 @@ Daily at 09:00 UTC, or when you press "Run workflow"
         |
         v
 1. Find the Curbox release to build ("latest" asks GitHub for the newest one)
-2. Already built "<version>-grayscale-p<patch set>"?  yes -> stop (unless "force" is ticked)
+2. Already built "<version>-grayscale-p<patch set>"?  yes -> skip the build (unless "force" is ticked); only check the app hub (step 9)
 3. Download the official Curbox source code for that release
 4. Apply every patches/*.patch, in name order
 5. Run the grayscale patch's unit tests
 6. Build the fdroid release APK and sign it with the PERSONAL key
 7. Check the signer matches PERSONAL in android-apps/apps.json (stops if not)
-8. Publish release "<version>-grayscale-p<patch set>" here (an older Curbox version is marked pre-release)
-9. If it is the newest Curbox release, also replace Curbox.apk on the app hub
+8. Publish release "<version>-grayscale-p<patch set>" here. It becomes the Latest release, unless this repo already has a full release for a newer Curbox version; then it is published as a pre-release
+9. If it is the Latest build, also replace Curbox.apk on the app hub. Before building, the run stops with an error if the `APP_HUB_TOKEN` secret is missing or no longer works. If an earlier run published the release but the hub update failed, the next run (daily or manual) sees that the hub's release title doesn't name this build and copies the published APK to the hub, without building again
 ```
 
-A patch is a list of edits, like "in this file, replace this line with that one." Each new Curbox release gets a fresh copy of the official code, and the edits are applied on top. Applying only fails when Curbox itself changed the same lines a patch edits. The patches are applied in name order, each as its own commit, and they apply cleanly together on Curbox 6.
+A patch is a list of edits, like "in this file, replace this line with that one." Each new Curbox release gets a fresh copy of the official code, and the edits are applied on top. Applying only fails when Curbox itself changed the same lines a patch edits. The patches are applied in name order, each as its own commit, and they apply cleanly together on Curbox 7.
 
 ### Release names
 
@@ -42,7 +42,7 @@ Each release is named `<version>-grayscale-p<patch set>`, for example `6-graysca
 - `<version>` is the Curbox release, like `6`.
 - `<patch set>` counts the commits on `main` that changed `patches/`. Any patch change makes it go up by one. That only holds on `main` with its full history, so the workflow refuses to publish from another branch or a shallow checkout. Don't rewrite `main`'s history (force push): a number could repeat, and the build would be skipped as "already built".
 
-Why: Obtainium decides there is an update when the release name changes. It can't use the app's own version, because the patches never change it (Curbox 6 is always `6-fdroid`). So a rebuild under the same name looks like no update at all. A new patch set gets a new name, so:
+Why: Obtainium decides there is an update when the release name changes. It can't use the app's own version, because the patches never change it (Curbox 7 is always `7-fdroid`). So a rebuild under the same name looks like no update at all. A new patch set gets a new name, so:
 
 - Obtainium offers it as an update.
 - The daily check builds it on its own, because that name isn't built yet. No **force** needed.
@@ -50,7 +50,7 @@ Why: Obtainium decides there is an update when the release name changes. It can'
 
 **force** rebuilds the same name in place, so Obtainium won't notice it. Use it only to fix a broken build.
 
-A build of an older Curbox version (for example `6` after `7` is out) is published as a pre-release. Obtainium skips pre-releases by default, so it never offers an older Curbox as an update.
+A build is published as a pre-release only when this repo already has a full (not pre-release) build of a newer Curbox version, for example a rebuild of `7` after an `8` build is out. Obtainium skips pre-releases by default, so it never offers an older Curbox as an update. Curbox 6 can no longer be rebuilt: the workflow refuses versions below 7, and the patches are made against 7.
 
 #### One-time check in Obtainium
 
@@ -71,6 +71,7 @@ Then pull down to check for updates. The first `-p` release shows up as an updat
 - **New file `GrayscaleOwner.kt`.** It watches the system grayscale setting and runs those rules. It stores "Curbox owns it" in a folder Android never backs up, so restoring a backup can't bring back an old value.
 - **`GrayScaleFilter.kt` (Curbox's file).** Only 6 lines change: its on/off calls go through `GrayscaleOwner`. Keeping this small is what makes future releases easy to patch.
 - **Known edge case:** if another app turns grayscale on within 10 seconds after a Curbox "on" that failed, Curbox treats that filter as its own.
+- **Still needed in Curbox 7.** Curbox 7's "fix grayscale bugs" only makes Shizuku work from the blocker service (Shizuku multi-process support in `Curbox.kt`). `GrayScaleFilter.kt` is unchanged: stock Curbox still switches grayscale off whenever the app in front isn't in an active grayscale group, even with no groups at all. With that fix its "off" commands now actually run through Shizuku, so without this patch it fights GrayScaler+ more than before.
 
 ### What the Firefox patch changes
 
@@ -145,14 +146,16 @@ git add patches/<name>.patch && git commit -m "Patch for Curbox 7" && git push
 
 1. In `curbox-android`, run `git switch patch/<name>`.
 2. Edit the files.
-3. Grayscale: run `./gradlew testFullDebugUnitTest --tests "*GrayscaleOwnership*"`. Other patches: run `./gradlew assembleFdroidDebug`.
+3. Grayscale: run `./gradlew testFdroidDebugUnitTest --tests "*GrayscaleOwnership*"`. Other patches: run `./gradlew assembleFdroidDebug`.
 4. Run `git commit -a --amend`. Each patch must stay **one** commit.
 5. Run `scripts/refresh-patch.sh ../curbox-android <current version> <name>`.
 6. Do the three printed steps. The next daily check builds the new patch set as a new release; to get it now, run the workflow (no **force** needed).
 
 ### Run the tests locally
 
-Curbox's fdroid unit tests don't compile in stock Curbox, because `SupabaseRestTest` needs sync-only classes. That's why the patch's tests run on the `full` flavor. They test the same logic.
+Since Curbox 7 the fdroid unit tests compile, so the grayscale tests run on the fdroid flavor, the one this repo ships: `./gradlew testFdroidDebugUnitTest --tests "*GrayscaleOwnership*"`. (In Curbox 6 they didn't compile, because `SupabaseRestTest` needed sync-only classes, so they ran on `full`.)
+
+Stock Curbox 7 has one failing unit test, `ScriptLanguageTest.matchesRegexSupportsCommonFlags`. The test itself is wrong (its script text writes `\n`, which the script language reads as a backslash and an `n`, not a line break), so it fails on every computer. It has nothing to do with these patches.
 
 ## Signing
 
@@ -164,7 +167,7 @@ Curbox's fdroid unit tests don't compile in stock Curbox, because `SupabaseRestT
   | `SIGNING_KEY` | the PERSONAL keystore, base64 |
   | `ALIAS` | its key alias |
   | `KEY_STORE_PASSWORD`, `KEY_PASSWORD` | its password |
-  | `APP_HUB_TOKEN` | fine-grained token with contents read/write on `android-apps` only; without it the hub step is skipped with a warning |
+  | `APP_HUB_TOKEN` | fine-grained token with contents read/write on `android-apps` only; if it is missing, expired or revoked, every run fails, including the idle daily check, until the token is fixed (a build that should update the hub stops before building) |
 
 - To set them again from 1Password without printing anything:
 

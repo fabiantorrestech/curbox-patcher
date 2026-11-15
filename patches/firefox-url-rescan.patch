@@ -1,4 +1,4 @@
-From ddaa7e283e14ed9bdf7b20360cf641c4cda2d36b Mon Sep 17 00:00:00 2001
+From 409f95e19db6df68b18ab5db1e7cfac9537e964c Mon Sep 17 00:00:00 2001
 From: fab <faibiantorrestech@gmail.com>
 Date: Fri, 13 Nov 2026 23:11:24 -0600
 Subject: [PATCH] fix(website): re-read the browser url bar after a burst of

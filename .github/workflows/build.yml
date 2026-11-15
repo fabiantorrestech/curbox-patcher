@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release:
-        description: 'Curbox release to patch (6 or later), or "latest"'
+        description: 'Curbox release to patch (7 or later), or "latest"'
         required: true
         default: latest
       force:
@@ -24,9 +24,13 @@ concurrency:
 
 env:
   UPSTREAM: curbox-app/curbox-android
-  MIN_RELEASE: 6
+  # The patches are made against Curbox 7; the 6 builds stay under Releases.
+  MIN_RELEASE: 7
   HUB: fabiantorrestech/android-apps
   HUB_KEY: PERSONAL
+  # The hub's rolling release, and the title prefix that records which build it holds.
+  HUB_RELEASE: curbox
+  HUB_NAME: Curbox (grayscale patch)
 
 jobs:
   build:
@@ -43,6 +47,7 @@ jobs:
         id: rel
         env:
           GH_TOKEN: ${{ github.token }}
+          HUB_TOKEN: ${{ secrets.APP_HUB_TOKEN }}
           INPUT_RELEASE: ${{ github.event.inputs.release || 'latest' }}
           INPUT_FORCE: ${{ github.event.inputs.force || 'false' }}
         run: |
@@ -84,14 +89,74 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "out=$OUT" >> "$GITHUB_OUTPUT"
           echo "patch_set=$PATCH_SET" >> "$GITHUB_OUTPUT"
-          # Only the newest upstream release becomes "latest" here, so update apps never downgrade.
-          if [ "$TAG" = "$LATEST" ]; then echo "latest=true" >> "$GITHUB_OUTPUT"; else echo "latest=false" >> "$GITHUB_OUTPUT"; fi
+          # A build is the newest one (Latest here, a full release, and sent to the hub) unless
+          # this repo already has a full release for a newer Curbox, so a rebuild of an older
+          # Curbox never replaces a newer build in update apps. (Curbox 6 can no longer be
+          # rebuilt at all: MIN_RELEASE is 7 and the patches are made against 7.)
+          # The listing runs on its own so a failing gh call stops the step instead of
+          # silently counting as "nothing newer".
+          OWN_RELEASES="$(gh release list -R "$GITHUB_REPOSITORY" --limit 1000 \
+            --json tagName,isPrerelease,isDraft \
+            -q '.[] | select((.isPrerelease or .isDraft) | not) | .tagName')"
+          NEWEST_BUILT="$(printf '%s\n' "$OWN_RELEASES" | grep -- '-grayscale' \
+            | sed 's/-grayscale.*//' | sort -V | tail -1 || true)"
+          if [ -n "$NEWEST_BUILT" ] && [ "$NEWEST_BUILT" != "$TAG" ] &&
+            [ "$(printf '%s\n%s\n' "$TAG" "$NEWEST_BUILT" | sort -V | tail -1)" = "$NEWEST_BUILT" ]; then
+            LATEST_BUILD=false
+          else
+            LATEST_BUILD=true
+          fi
+          echo "latest=$LATEST_BUILD" >> "$GITHUB_OUTPUT"
 
           if gh release view "$OUT" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 && [ "$INPUT_FORCE" != "true" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Release **$OUT** already exists (Curbox $TAG, patch set $PATCH_SET). Nothing to do (run with *force* to rebuild it in place)." >> "$GITHUB_STEP_SUMMARY"
+            echo "Release **$OUT** already exists (Curbox $TAG, patch set $PATCH_SET). No build needed (run with *force* to rebuild it in place)." >> "$GITHUB_STEP_SUMMARY"
+            SKIP=true
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
+            SKIP=false
+            if [ "$LATEST_BUILD" = "false" ]; then
+              echo "Curbox $NEWEST_BUILT already has a full release here, so this build of $TAG is published as a pre-release and not sent to the app hub." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+
+          # The hub is updated for every new Latest build, and also when an earlier run published
+          # this release but failed to update the hub (for example with an expired token). The
+          # hub release's title names the build it holds; when it doesn't name this one, the
+          # already published APK is copied to the hub without building again.
+          HUB_UPDATE=false
+          if [ "$LATEST_BUILD" = "true" ]; then
+            if [ "$SKIP" = "false" ]; then
+              HUB_UPDATE=true
+            else
+              if HUB_TITLE="$(GH_TOKEN="$HUB_TOKEN" gh release view "$HUB_RELEASE" -R "$HUB" --json name -q .name 2>/dev/null)"; then
+                if [ "$HUB_TITLE" != "$HUB_NAME $OUT" ]; then
+                  HUB_UPDATE=true
+                  echo "The app hub holds \"$HUB_TITLE\", not $OUT, so this run copies $OUT to the hub." >> "$GITHUB_STEP_SUMMARY"
+                fi
+              else
+                HUB_UPDATE=true
+                echo "Couldn't read the app hub (token missing or invalid, or no \`$HUB_RELEASE\` release there yet), so this run tries to copy $OUT to the hub." >> "$GITHUB_STEP_SUMMARY"
+              fi
+            fi
+          fi
+          echo "hub=$HUB_UPDATE" >> "$GITHUB_OUTPUT"
+
+      # Fail before building, not after publishing, when the hub can't be updated.
+      - name: Check app hub token
+        if: steps.rel.outputs.hub == 'true'
+        env:
+          HUB_TOKEN: ${{ secrets.APP_HUB_TOKEN }}
+        run: |
+          if [ -z "$HUB_TOKEN" ]; then
+            echo "::error::The APP_HUB_TOKEN secret is missing, so the app hub can't be updated. Set it (see README, Signing) and run again."
+            exit 1
+          fi
+          # Catches an expired or revoked token. Write access itself is only proven by the
+          # upload; if that fails, the next run sees the stale hub and retries without rebuilding.
+          if ! GH_TOKEN="$HUB_TOKEN" gh api "repos/$HUB" --silent; then
+            echo "::error::APP_HUB_TOKEN can't read $HUB (expired, revoked or wrong). Replace it (see README, Signing) and run again."
+            exit 1
           fi
 
       - name: Clone Curbox ${{ steps.rel.outputs.tag }}
@@ -141,14 +206,13 @@ jobs:
         with:
           packages: 'platform-tools build-tools;29.0.3'
 
-      # fdroid unit tests don't compile upstream (SupabaseRestTest needs sync classes), so the
-      # patch's tests run on the full flavor; the logic under test is flavor independent.
+      # Since Curbox 7 the fdroid unit tests compile, so the tests run on the flavor we ship.
       - name: Run grayscale tests
         if: steps.rel.outputs.skip == 'false'
         working-directory: curbox
         run: |
           chmod +x gradlew
-          ./gradlew testFullDebugUnitTest --tests "*GrayscaleOwnership*"
+          ./gradlew testFdroidDebugUnitTest --tests "*GrayscaleOwnership*"
 
       - name: Build fdroid release APK
         if: steps.rel.outputs.skip == 'false'
@@ -224,32 +288,54 @@ jobs:
           body_path: release-notes.md
           files: ${{ steps.apk.outputs.path }}
           make_latest: ${{ steps.rel.outputs.latest }}
-          # A build of an older Curbox is newer by date. Marking it a pre-release keeps Obtainium
-          # (which skips pre-releases by default) from offering it as an update.
+          # A build of an older Curbox than one already released here is newer by date. Marking it
+          # a pre-release keeps Obtainium (which skips pre-releases by default) from offering it.
           prerelease: ${{ steps.rel.outputs.latest != 'true' }}
 
+      # Only for a hub retry: the release exists, so take its APK instead of building again.
+      - name: Download the published APK
+        if: steps.rel.outputs.skip == 'true' && steps.rel.outputs.hub == 'true'
+        id: published
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUT: ${{ steps.rel.outputs.out }}
+        run: |
+          set -euo pipefail
+          DEST="curbox-${OUT}-fdroid.apk"
+          gh release download "$OUT" -R "$GITHUB_REPOSITORY" --pattern "$DEST" --clobber
+          echo "path=$DEST" >> "$GITHUB_OUTPUT"
+          echo "published_at=$(gh release view "$OUT" -R "$GITHUB_REPOSITORY" --json publishedAt -q .publishedAt)" >> "$GITHUB_OUTPUT"
+
       # Same rolling-release step as the other apps' workflows (android-apps ADR 4 and 8).
-      # Only the newest upstream release goes to the hub, so its download never goes backwards.
+      # Only the newest build goes to the hub (see Resolve release), so its download never goes
+      # backwards.
       - name: Publish to the app hub (fabiantorrestech/android-apps)
-        if: steps.rel.outputs.skip == 'false' && steps.rel.outputs.latest == 'true'
+        if: steps.rel.outputs.hub == 'true'
         env:
           GH_TOKEN: ${{ secrets.APP_HUB_TOKEN }}
-          TAG: curbox
-          NAME: Curbox (grayscale patch)
-          SRC: ${{ steps.apk.outputs.path }}
+          SRC: ${{ steps.apk.outputs.path || steps.published.outputs.path }}
           OUT: ${{ steps.rel.outputs.out }}
           UPSTREAM_TAG: ${{ steps.rel.outputs.tag }}
+          COPIED: ${{ steps.rel.outputs.skip }}
+          PUBLISHED_AT: ${{ steps.published.outputs.published_at }}
         run: |
+          set -euo pipefail
           if [ -z "$GH_TOKEN" ]; then
-            echo "::warning::APP_HUB_TOKEN missing: not publishing to the hub"
-            exit 0
+            echo "::error::APP_HUB_TOKEN is missing: the app hub was not updated."
+            exit 1
           fi
           cp "$SRC" Curbox.apk
-          title="$NAME $OUT"
-          notes="Built by CI from ${GITHUB_REPOSITORY}@${GITHUB_SHA::7}: Curbox $UPSTREAM_TAG with the grayscale, Firefox and unlock waits patches, on $(date -u '+%Y-%m-%d %H:%M') UTC."
-          if gh release view "$TAG" --repo "$HUB" > /dev/null 2>&1; then
-            gh release upload "$TAG" Curbox.apk --repo "$HUB" --clobber
-            gh release edit "$TAG" --repo "$HUB" --title "$title" --notes "$notes"
+          title="$HUB_NAME $OUT"
+          if [ "$COPIED" = "true" ]; then
+            # Retry path: this run built nothing, it copied the APK of an existing release.
+            notes="Curbox $UPSTREAM_TAG with the grayscale, Firefox and unlock waits patches. Copied from ${GITHUB_REPOSITORY} release $OUT (published $PUBLISHED_AT) on $(date -u '+%Y-%m-%d %H:%M') UTC."
           else
-            gh release create "$TAG" Curbox.apk --repo "$HUB" --target main --title "$title" --notes "$notes" --latest=false
+            notes="Built by CI from ${GITHUB_REPOSITORY}@${GITHUB_SHA::7}: Curbox $UPSTREAM_TAG with the grayscale, Firefox and unlock waits patches, on $(date -u '+%Y-%m-%d %H:%M') UTC."
+          fi
+          # The title is set last, so it only names this build once the APK is in place.
+          if gh release view "$HUB_RELEASE" --repo "$HUB" > /dev/null 2>&1; then
+            gh release upload "$HUB_RELEASE" Curbox.apk --repo "$HUB" --clobber
+            gh release edit "$HUB_RELEASE" --repo "$HUB" --title "$title" --notes "$notes"
+          else
+            gh release create "$HUB_RELEASE" Curbox.apk --repo "$HUB" --target main --title "$title" --notes "$notes" --latest=false
           fi

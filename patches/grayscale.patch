@@ -1,4 +1,4 @@
-From 744a73e9aa21e157eb869439795d3c663f38cea4 Mon Sep 17 00:00:00 2001
+From 930d8b1dccab88988c0af867edafa5b43202ce1d Mon Sep 17 00:00:00 2001
 From: fabt <46858378+fabiantorrestech@users.noreply.github.com>
 Date: Sun, 8 Nov 2026 19:05:14 -0600
 Subject: [PATCH] fix(grayscale): never switch off a filter Curbox did not

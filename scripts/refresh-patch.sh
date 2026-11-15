@@ -42,7 +42,7 @@ fi
 
 if [ "$NAME" = "grayscale" ]; then
   echo "Running the grayscale tests..."
-  ./gradlew -q testFullDebugUnitTest --tests "*GrayscaleOwnership*"
+  ./gradlew -q testFdroidDebugUnitTest --tests "*GrayscaleOwnership*"
 else
   echo "Building the fdroid flavor..."
   ./gradlew -q assembleFdroidDebug

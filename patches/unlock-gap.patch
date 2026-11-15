@@ -1,4 +1,4 @@
-From a711697d259e8f65af1ecd177abc78fd5cf260fe Mon Sep 17 00:00:00 2001
+From a5aed7423b691fa399d5137ffd956754082d2522 Mon Sep 17 00:00:00 2001
 From: fab <faibiantorrestech@gmail.com>
 Date: Sat, 14 Nov 2026 02:17:34 -0600
 Subject: [PATCH] feat(app blocker): growing wait between unlocks and emergency
@@ -56,7 +56,7 @@ Claude-Session: https://claude.ai/code/session_01AeXNKkBfqarSMLZWk676Bs
  create mode 100644 app/src/main/res/layout/fragment_unlock_gap.xml
 
 diff --git a/app/src/main/java/neth/iecal/curbox/blockers/AppBlocker.kt b/app/src/main/java/neth/iecal/curbox/blockers/AppBlocker.kt
-index 9fd9ce99..da9b3b0b 100644
+index 1ba0e17b..98bb3e60 100644
 --- a/app/src/main/java/neth/iecal/curbox/blockers/AppBlocker.kt
 +++ b/app/src/main/java/neth/iecal/curbox/blockers/AppBlocker.kt
 @@ -22,7 +22,10 @@ import neth.iecal.curbox.R
@@ -70,7 +70,7 @@ index 9fd9ce99..da9b3b0b 100644
  import neth.iecal.curbox.services.BaseBlockingService
  import neth.iecal.curbox.ui.activity.WarningActivity
  import neth.iecal.curbox.utils.AppSuspendHelper
-@@ -54,6 +57,13 @@ class AppBlocker : BaseBlocker() {
+@@ -55,6 +58,13 @@ class AppBlocker : BaseBlocker() {
          const val INTENT_ACTION_WARNING_SCREEN_VISIBILITY =
              "neth.iecal.curbox.appblocker.warning_screen_visibility"
          const val EXTRA_WARNING_SCREEN_VISIBLE = "warning_screen_visible"
@@ -84,7 +84,7 @@ index 9fd9ce99..da9b3b0b 100644
          private const val TARGET_EVENTS_MASK = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
      }
  
-@@ -76,6 +86,9 @@ class AppBlocker : BaseBlocker() {
+@@ -77,6 +87,9 @@ class AppBlocker : BaseBlocker() {
      // Holds the warning config last shown per group, used for the cooldown intent's default duration.
      private val appBlockerWarningScrnConfgs = ConcurrentHashMap<String, AppBlockerWarningScreenConfig>()
  
@@ -94,9 +94,9 @@ index 9fd9ce99..da9b3b0b 100644
      private lateinit var usageStats : UsageStatsHelper
      private var lastPackage = ""
      private lateinit var service: BaseBlockingService
-@@ -109,6 +122,12 @@ class AppBlocker : BaseBlocker() {
-             return
+@@ -111,6 +124,12 @@ class AppBlocker : BaseBlocker() {
          }
+         if (!service.isActivePackage(packageName)) return
  
 +        // A share sheet or permission dialog opened from an app is not leaving it,
 +        // so it must not end that app's on each open unlock. Groups that list one still apply.
@@ -107,7 +107,7 @@ index 9fd9ce99..da9b3b0b 100644
          clearFinishedOnEachOpenSessions(packageName)
  
          val now = System.currentTimeMillis()
-@@ -204,7 +223,10 @@ class AppBlocker : BaseBlocker() {
+@@ -206,7 +225,10 @@ class AppBlocker : BaseBlocker() {
              .map(AppGroupEntry::groupId)
              .distinct()
              .filter(cooldownGroupsList::containsKey)
@@ -118,8 +118,8 @@ index 9fd9ce99..da9b3b0b 100644
 +            }
      }
  
-     // THIS IS EXPORTED HERE INTENTIONALLY. THE APPBLOCKER SERVICE RUNS IN A DIFFERENT PROCESS THAN
-@@ -247,6 +269,7 @@ class AppBlocker : BaseBlocker() {
+     // All senders are in this app, including its other processes (the same UID).
+@@ -248,6 +270,7 @@ class AppBlocker : BaseBlocker() {
          settingsJob = CoroutineScope(Dispatchers.IO).launch {
              service.dataStoreManager.settings.collectLatest { settings ->
                  Log.d("AppBlocker", "Settings updated, groups count: ${settings.blockedAppGroups.size}")
@@ -127,7 +127,7 @@ index 9fd9ce99..da9b3b0b 100644
  
                  val newBlockedAppsList = ConcurrentHashMap<String, MutableList<AppGroupEntry>>()
                  settings.blockedAppGroups.upgradeLegacyAppGroupConfigs().forEach { group ->
-@@ -312,11 +335,84 @@ class AppBlocker : BaseBlocker() {
+@@ -313,11 +336,84 @@ class AppBlocker : BaseBlocker() {
              currentTimeMillis + durationMillis
          }
  
@@ -212,7 +212,7 @@ index 9fd9ce99..da9b3b0b 100644
      private fun getUsageLimitForToday(config: AppUsageConfig): Long {
          return if (config.isDailyUniform) {
              config.uniformLimit
-@@ -444,6 +540,15 @@ class AppBlocker : BaseBlocker() {
+@@ -445,6 +541,15 @@ class AppBlocker : BaseBlocker() {
              if (warningConfig.isWarningDialogHidden) return
              isWarningScreenVisible = true
  
@@ -228,7 +228,7 @@ index 9fd9ce99..da9b3b0b 100644
              handler.postDelayed({
                  val dialogIntent = Intent(service, WarningActivity::class.java).apply {
                      flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
-@@ -454,6 +559,9 @@ class AppBlocker : BaseBlocker() {
+@@ -455,6 +560,9 @@ class AppBlocker : BaseBlocker() {
                          "warning_config",
                          Gson().toJson(warningConfig)
                      )
@@ -239,10 +239,10 @@ index 9fd9ce99..da9b3b0b 100644
                  service.startActivity(dialogIntent)
              }, 100)
 diff --git a/app/src/main/java/neth/iecal/curbox/data/models/Settings.kt b/app/src/main/java/neth/iecal/curbox/data/models/Settings.kt
-index 1b1220fe..9e0b2b95 100644
+index 9c90e9e1..c0e6798c 100644
 --- a/app/src/main/java/neth/iecal/curbox/data/models/Settings.kt
 +++ b/app/src/main/java/neth/iecal/curbox/data/models/Settings.kt
-@@ -26,5 +26,6 @@ data class Settings(
+@@ -32,5 +32,6 @@ data class Settings(
      val nextWebsiteRecheckTime: Long = 0L,
      val serviceProtectionConfig: ServiceProtectionConfig = ServiceProtectionConfig(),
      val antiUninstallConfig2: AntiUninstallConfig = AntiUninstallConfig(),
@@ -251,15 +251,15 @@ index 1b1220fe..9e0b2b95 100644
 +    val unlockGapConfig: UnlockGapConfig = UnlockGapConfig()
  )
 diff --git a/app/src/main/java/neth/iecal/curbox/data/models/SettingsChangeDelayConfig.kt b/app/src/main/java/neth/iecal/curbox/data/models/SettingsChangeDelayConfig.kt
-index 8c4c8e63..e55a0fed 100644
+index d58320d5..63a84f88 100644
 --- a/app/src/main/java/neth/iecal/curbox/data/models/SettingsChangeDelayConfig.kt
 +++ b/app/src/main/java/neth/iecal/curbox/data/models/SettingsChangeDelayConfig.kt
-@@ -16,7 +16,10 @@ enum class GatedSettingsField {
-     UI_HIDER,
-     APP_USAGE_TRACKING,
+@@ -18,7 +18,10 @@ enum class GatedSettingsField {
      WEBSITE_USAGE_TRACKING,
--    CHANGE_DELAY
-+    CHANGE_DELAY,
+     CHANGE_DELAY,
+     SIP_STRETCH,
+-    SCHEDULED_NOTIFICATIONS
++    SCHEDULED_NOTIFICATIONS,
 +    /** Day end times only. Builds before [EMERGENCY_UNLOCK] stored the whole [UnlockGapConfig] here. */
 +    UNLOCK_GAP,
 +    EMERGENCY_UNLOCK
@@ -366,13 +366,13 @@ index 00000000..fefbcd5d
 +        }
 +}
 diff --git a/app/src/main/java/neth/iecal/curbox/data/models/WarningScreenConfig.kt b/app/src/main/java/neth/iecal/curbox/data/models/WarningScreenConfig.kt
-index d355a2aa..ff6d5fdc 100755
+index 4dca2361..62f096f0 100755
 --- a/app/src/main/java/neth/iecal/curbox/data/models/WarningScreenConfig.kt
 +++ b/app/src/main/java/neth/iecal/curbox/data/models/WarningScreenConfig.kt
-@@ -36,6 +36,11 @@ data class AppBlockerWarningScreenConfig(
-     val focusGoalRequiredMinutes: Int = 60,
+@@ -37,6 +37,11 @@ data class AppBlockerWarningScreenConfig(
      /** For app groups, grant access only for the current selected-app session. */
      val isOnOpenConfig: Boolean = false,
+     val externalUnlockCondition: ExternalUnlockCondition? = null,
 +    /** For app groups, wait longer after each unlock before the next one. Resets at the day end. */
 +    val isUnlockGapEnabled: Boolean = false,
 +    val unlockGapStartMn: Int = 1,
@@ -403,10 +403,10 @@ index 00000000..d9e57eef
 +    "com.android.permissioncontroller",
 +)
 diff --git a/app/src/main/java/neth/iecal/curbox/ui/activity/FragmentActivity.kt b/app/src/main/java/neth/iecal/curbox/ui/activity/FragmentActivity.kt
-index c5754b1e..2257999e 100644
+index 2f8bd95c..c0daeed4 100644
 --- a/app/src/main/java/neth/iecal/curbox/ui/activity/FragmentActivity.kt
 +++ b/app/src/main/java/neth/iecal/curbox/ui/activity/FragmentActivity.kt
-@@ -107,6 +107,7 @@ class FragmentActivity : AppCompatActivity() {
+@@ -114,6 +114,7 @@ class FragmentActivity : AppCompatActivity() {
              AntiUninstallFragment.FRAGMENT_ID,
              ServiceProtectionFragment.FRAGMENT_ID,
              SettingsChangeDelayFragment.FRAGMENT_ID,
@@ -414,7 +414,7 @@ index c5754b1e..2257999e 100644
              CreateKeywordGroupFragment.FRAGMENT_ID -> {
                  // Hide bottom nav for these standalone fragments
                  bottomNav.visibility = android.view.View.GONE
-@@ -132,6 +133,7 @@ class FragmentActivity : AppCompatActivity() {
+@@ -143,6 +144,7 @@ class FragmentActivity : AppCompatActivity() {
                      AntiUninstallFragment.FRAGMENT_ID -> AntiUninstallFragment()
                      ServiceProtectionFragment.FRAGMENT_ID -> ServiceProtectionFragment()
                      SettingsChangeDelayFragment.FRAGMENT_ID -> SettingsChangeDelayFragment()
@@ -423,28 +423,28 @@ index c5754b1e..2257999e 100644
                  }
                  fragment.arguments = intent.extras
 diff --git a/app/src/main/java/neth/iecal/curbox/ui/activity/WarningActivity.kt b/app/src/main/java/neth/iecal/curbox/ui/activity/WarningActivity.kt
-index cef4e4f6..8a4ff8cd 100755
+index c622b59a..3785aaca 100755
 --- a/app/src/main/java/neth/iecal/curbox/ui/activity/WarningActivity.kt
 +++ b/app/src/main/java/neth/iecal/curbox/ui/activity/WarningActivity.kt
-@@ -19,6 +19,8 @@ import androidx.appcompat.app.AlertDialog
- import androidx.appcompat.app.AppCompatActivity
+@@ -22,6 +22,8 @@ import androidx.appcompat.app.AppCompatActivity
  import androidx.lifecycle.lifecycleScope
+ import androidx.transition.TransitionManager
  import com.google.android.material.dialog.MaterialAlertDialogBuilder
 +import com.google.android.material.textfield.TextInputEditText
 +import com.google.android.material.textfield.TextInputLayout
  import com.google.gson.Gson
  import com.journeyapps.barcodescanner.ScanContract
  import com.journeyapps.barcodescanner.ScanOptions
-@@ -31,6 +33,7 @@ import neth.iecal.curbox.blockers.ReelBlocker
- import neth.iecal.curbox.data.db.AppDatabase
+@@ -40,6 +42,7 @@ import neth.iecal.curbox.data.db.AppDatabase
+ import neth.iecal.curbox.data.models.ExternalUnlockCondition
  import neth.iecal.curbox.data.models.AppBlockerWarningScreenConfig
  import neth.iecal.curbox.databinding.DialogWarningOverlayBinding
 +import neth.iecal.curbox.utils.AntiUninstallManager
  import neth.iecal.curbox.utils.DataStoreManager
  import neth.iecal.curbox.utils.FocusGoalProgress
  import java.util.Calendar
-@@ -50,6 +53,8 @@ import neth.iecal.curbox.anti_stimulants.MindfulMessage
- class WarningActivity : AppCompatActivity() {
+@@ -132,6 +135,8 @@ class WarningActivity : AppCompatActivity() {
+     }
  
      private var proceedTimer: CountDownTimer? = null
 +    private var unlockGapTimer: CountDownTimer? = null
@@ -452,9 +452,9 @@ index cef4e4f6..8a4ff8cd 100755
      private var dialog: AlertDialog? = null
  
      private var vibrator: Vibrator? = null
-@@ -109,6 +114,9 @@ class WarningActivity : AppCompatActivity() {
-         )
- 
+@@ -193,6 +198,9 @@ class WarningActivity : AppCompatActivity() {
+         externalCondition = warningScreenConfig.externalUnlockCondition
+         externalWarningConfig = warningScreenConfig
          val targetId = intent.getStringExtra("result_id") ?: ""
 +        val unlockGapEndsAt = intent.getLongExtra(AppBlocker.EXTRA_UNLOCK_GAP_ENDS_AT, 0L)
 +        val nextUnlockGapMinutes = intent.getLongExtra(AppBlocker.EXTRA_NEXT_UNLOCK_GAP_MN, 0L)
@@ -462,7 +462,7 @@ index cef4e4f6..8a4ff8cd 100755
          var isProceedLimitExceeded = false
          var timeUntilNextProceedMn = 0L
          var proceedsLeft = -1
-@@ -275,7 +283,37 @@ class WarningActivity : AppCompatActivity() {
+@@ -362,7 +370,37 @@ class WarningActivity : AppCompatActivity() {
                          }
                          binding.proceedSeconds.visibility = View.GONE
                      }
@@ -501,7 +501,7 @@ index cef4e4f6..8a4ff8cd 100755
          }
  
          dialog = MaterialAlertDialogBuilder(this)
-@@ -447,6 +485,87 @@ class WarningActivity : AppCompatActivity() {
+@@ -613,6 +651,87 @@ class WarningActivity : AppCompatActivity() {
          }
      }
  
@@ -589,7 +589,7 @@ index cef4e4f6..8a4ff8cd 100755
      private fun setupAdaptiveMathChallenge(questionCount: Int, startingLevel: Int) {
          val challenge = AdaptiveMathChallenge(
              requiredAnswers = questionCount.coerceIn(
-@@ -637,6 +756,7 @@ class WarningActivity : AppCompatActivity() {
+@@ -803,6 +922,7 @@ class WarningActivity : AppCompatActivity() {
  
      private fun restrictFocusGoal(message: String) {
          binding.focusGoalStatus.text = message
@@ -597,7 +597,7 @@ index cef4e4f6..8a4ff8cd 100755
          binding.btnProceed.visibility = View.GONE
          binding.btnCancel.setText(R.string.okay)
      }
-@@ -707,6 +827,7 @@ class WarningActivity : AppCompatActivity() {
+@@ -874,6 +994,7 @@ class WarningActivity : AppCompatActivity() {
          super.onDestroy()
          stopNfcUnlockScan()
          proceedTimer?.cancel()
@@ -605,7 +605,7 @@ index cef4e4f6..8a4ff8cd 100755
          mathRetryTimer?.cancel()
          vibrator?.cancel()
          dialog?.dismiss()
-@@ -716,11 +837,13 @@ class WarningActivity : AppCompatActivity() {
+@@ -883,11 +1004,13 @@ class WarningActivity : AppCompatActivity() {
          id: String,
          action: String,
          time: Int,
@@ -619,7 +619,7 @@ index cef4e4f6..8a4ff8cd 100755
          if (onDelivered == null) {
              sendBroadcast(intent)
              return
-@@ -807,5 +930,6 @@ class WarningActivity : AppCompatActivity() {
+@@ -976,5 +1099,6 @@ class WarningActivity : AppCompatActivity() {
          const val MAX_ADAPTIVE_MATH_LEVEL = 10
          const val MIN_FOCUS_GOAL_MINUTES = 15
          const val MAX_FOCUS_GOAL_MINUTES = 24 * 60
@@ -627,10 +627,10 @@ index cef4e4f6..8a4ff8cd 100755
      }
  }
 diff --git a/app/src/main/java/neth/iecal/curbox/ui/fragments/main/reducers/ReducersFragment.kt b/app/src/main/java/neth/iecal/curbox/ui/fragments/main/reducers/ReducersFragment.kt
-index b2ea98b0..ac887f44 100644
+index 407b9099..cf6a2bb9 100644
 --- a/app/src/main/java/neth/iecal/curbox/ui/fragments/main/reducers/ReducersFragment.kt
 +++ b/app/src/main/java/neth/iecal/curbox/ui/fragments/main/reducers/ReducersFragment.kt
-@@ -121,6 +121,14 @@ class ReducersFragment : Fragment() {
+@@ -153,6 +153,14 @@ class ReducersFragment : Fragment() {
              startActivity(intent)
          }
  
@@ -873,10 +873,10 @@ index 00000000..68386d86
 +    }
 +}
 diff --git a/app/src/main/java/neth/iecal/curbox/ui/fragments/main/reducers/blockertools/shared/WarningConfigFormController.kt b/app/src/main/java/neth/iecal/curbox/ui/fragments/main/reducers/blockertools/shared/WarningConfigFormController.kt
-index 4a8df8b7..31624210 100644
+index e31563b1..dd8240d1 100644
 --- a/app/src/main/java/neth/iecal/curbox/ui/fragments/main/reducers/blockertools/shared/WarningConfigFormController.kt
 +++ b/app/src/main/java/neth/iecal/curbox/ui/fragments/main/reducers/blockertools/shared/WarningConfigFormController.kt
-@@ -124,6 +124,20 @@ internal class WarningConfigFormController(
+@@ -144,6 +144,20 @@ internal class WarningConfigFormController(
          )
          updateProceedWindowInput(initialInputValue)
  
@@ -897,7 +897,7 @@ index 4a8df8b7..31624210 100644
          binding.warningMsgEdit.setText(config.message.joinToString(", "))
          binding.switchVibrateBrightness.isChecked = config.vibrateAndIncBrightness
      }
-@@ -166,6 +180,27 @@ internal class WarningConfigFormController(
+@@ -186,6 +200,27 @@ internal class WarningConfigFormController(
          binding.proceedLimitSwitch.setOnCheckedChangeListener { _, isChecked ->
              binding.proceedLimitContainer.isVisible = isChecked
          }
@@ -925,12 +925,12 @@ index 4a8df8b7..31624210 100644
          binding.switchOnEachOpen.setOnCheckedChangeListener { _, isChecked ->
              val challengeIndex = selectedChallengeIndex()
              if (isChecked && challengeIndex == WarningUnlockSelectionMapper.NO_EFFORT_INDEX) {
-@@ -289,7 +324,11 @@ internal class WarningConfigFormController(
-             proceedLimitEnabled = binding.proceedLimitSwitch.isChecked,
-             allowedProceeds = numericInputValue(binding.allowedProceedsInput).toInt(),
+@@ -311,7 +346,11 @@ internal class WarningConfigFormController(
              proceedsTimeWindowMn = selectedProceedWindowMinutes(),
--            isOnOpenConfig = isOnEachOpenEnabled()
-+            isOnOpenConfig = isOnEachOpenEnabled(),
+             isOnOpenConfig = isOnEachOpenEnabled(),
+             externalUnlockCondition = if (selectedChallengeIndex() == WarningUnlockSelectionMapper.EFFORT_INDEX &&
+-                selectedSecondaryIndex(selectedChallengeIndex()) == 5) selectedExternalCondition else null
++                selectedSecondaryIndex(selectedChallengeIndex()) == 5) selectedExternalCondition else null,
 +            isUnlockGapEnabled = supportsOnEachOpen && binding.unlockGapSwitch.isChecked,
 +            unlockGapStartMn = numericInputValue(binding.unlockGapStartInput).toInt(),
 +            unlockGapStepMn = numericInputValue(binding.unlockGapStepInput).toInt(),
@@ -938,7 +938,7 @@ index 4a8df8b7..31624210 100644
          )
      }
  
-@@ -407,6 +446,24 @@ internal class WarningConfigFormController(
+@@ -434,6 +473,24 @@ internal class WarningConfigFormController(
                  binding.focusGoalMinutesSlider,
                  binding.focusGoalMinutesInput,
                  binding.focusGoalMinutesInputLayout
@@ -963,7 +963,7 @@ index 4a8df8b7..31624210 100644
              )
          )
      }
-@@ -627,6 +684,18 @@ internal class WarningConfigFormController(
+@@ -657,6 +714,18 @@ internal class WarningConfigFormController(
          setNumericInputValue(binding.focusGoalMinutesInput, value)
      }
  
@@ -982,7 +982,7 @@ index 4a8df8b7..31624210 100644
      private fun unitOptions(): List<String> {
          return listOf(
              fragment.getString(R.string.unit_minutes),
-@@ -658,6 +727,7 @@ internal class WarningConfigFormController(
+@@ -688,6 +757,7 @@ internal class WarningConfigFormController(
          const val MAX_MATH_LEVEL = 10
          const val MIN_FOCUS_MINUTES = 15
          const val MAX_FOCUS_MINUTES = 24 * 60
@@ -991,10 +991,10 @@ index 4a8df8b7..31624210 100644
  }
  
 diff --git a/app/src/main/java/neth/iecal/curbox/utils/DataStore.kt b/app/src/main/java/neth/iecal/curbox/utils/DataStore.kt
-index fb2102a2..0194e231 100644
+index e55074c9..8013e719 100644
 --- a/app/src/main/java/neth/iecal/curbox/utils/DataStore.kt
 +++ b/app/src/main/java/neth/iecal/curbox/utils/DataStore.kt
-@@ -10,6 +10,7 @@ import androidx.datastore.core.MultiProcessDataStoreFactory
+@@ -11,6 +11,7 @@ import androidx.datastore.core.MultiProcessDataStoreFactory
  import androidx.datastore.core.Serializer
  import com.google.gson.Gson
  import com.google.gson.JsonParseException
@@ -1002,7 +1002,7 @@ index fb2102a2..0194e231 100644
  import com.google.gson.reflect.TypeToken
  import kotlinx.coroutines.flow.first
  import kotlinx.coroutines.flow.map
-@@ -18,6 +19,7 @@ import kotlinx.coroutines.Dispatchers
+@@ -19,6 +20,7 @@ import kotlinx.coroutines.Dispatchers
  import kotlinx.coroutines.withContext
  import neth.iecal.curbox.R
  import neth.iecal.curbox.data.models.AppGroup
@@ -1010,7 +1010,7 @@ index fb2102a2..0194e231 100644
  import neth.iecal.curbox.data.models.GatedSettingsField
  import neth.iecal.curbox.data.models.KeywordBlocker
  import neth.iecal.curbox.data.models.ManualFocusGroup
-@@ -26,6 +28,8 @@ import neth.iecal.curbox.data.models.PomodoroState
+@@ -27,6 +29,8 @@ import neth.iecal.curbox.data.models.PomodoroState
  import neth.iecal.curbox.data.models.Settings
  import neth.iecal.curbox.data.models.SettingsChangeDelayConfig
  import neth.iecal.curbox.data.models.SettingsChangeDelayPrefs
@@ -1019,7 +1019,7 @@ index fb2102a2..0194e231 100644
  import neth.iecal.curbox.data.models.upgradeLegacyAppGroupConfigs
  import neth.iecal.curbox.data.models.upgradeLegacyKeywordGroupConfigs
  import neth.iecal.curbox.data.models.upgradeLegacyConfig
-@@ -121,6 +125,56 @@ private class ScheduledUsageConfigMigration(
+@@ -122,6 +126,56 @@ private class ScheduledUsageConfigMigration(
      }.getOrNull()
  }
  
@@ -1076,7 +1076,7 @@ index fb2102a2..0194e231 100644
  class DataStoreManager(private val context: Context) {
      private val gson = Gson()
  
-@@ -141,7 +195,10 @@ class DataStoreManager(private val context: Context) {
+@@ -142,7 +196,10 @@ class DataStoreManager(private val context: Context) {
                          type = Settings::class.java,
                          defaultValue = Settings()
                      ),
@@ -1088,16 +1088,16 @@ index fb2102a2..0194e231 100644
                      produceFile = { File(context.applicationContext.filesDir, "datastore/settings.json") }
                  ).also { INSTANCE = it }
              }
-@@ -242,6 +299,7 @@ class DataStoreManager(private val context: Context) {
-                 uiHiderConfig = current.uiHiderConfig,
+@@ -309,6 +366,7 @@ class DataStoreManager(private val context: Context) {
                  nextWebsiteRecheckTime = current.nextWebsiteRecheckTime,
+                 externalUnlockConditions = current.externalUnlockConditions,
                  settingsChangeDelayConfig2 = delayConfig,
 +                unlockGapConfig = current.unlockGapConfig,
              )
  
              for (field in GatedSettingsField.values()) {
-@@ -389,6 +447,18 @@ class DataStoreManager(private val context: Context) {
-         updateGated(GatedSettingsField.MINDFUL_MESSAGES) { config }
+@@ -479,6 +537,18 @@ class DataStoreManager(private val context: Context) {
+         settingsDataStore.updateData { it.copy(urgeSurfConfig = config) }
      }
  
 +    suspend fun updateUnlockGapDayEnds(transform: (List<Int>) -> List<Int>) {
@@ -1115,7 +1115,7 @@ index fb2102a2..0194e231 100644
      suspend fun updateUiHiderConfig(transform: (neth.iecal.curbox.data.models.UiHiderConfig) -> neth.iecal.curbox.data.models.UiHiderConfig) {
          updateGated(GatedSettingsField.UI_HIDER) { transform(it.uiHiderConfig.normalized()) }
      }
-@@ -703,6 +773,21 @@ class DataStoreManager(private val context: Context) {
+@@ -807,6 +877,21 @@ class DataStoreManager(private val context: Context) {
                          requireTamperProtectionOff = prefs.requireTamperProtectionOff
                      ))
                  }
@@ -1137,7 +1137,7 @@ index fb2102a2..0194e231 100644
              }
          }.getOrNull()
      }
-@@ -729,6 +814,8 @@ class DataStoreManager(private val context: Context) {
+@@ -835,6 +920,8 @@ class DataStoreManager(private val context: Context) {
                      requireTamperProtectionOff =
                          settings.settingsChangeDelayConfig2.requireTamperProtectionOff,
                  )
@@ -1147,18 +1147,18 @@ index fb2102a2..0194e231 100644
              gson.toJson(value)
          }.getOrNull()
 diff --git a/app/src/main/java/neth/iecal/curbox/utils/RestrictionComparator.kt b/app/src/main/java/neth/iecal/curbox/utils/RestrictionComparator.kt
-index 5112afc4..96f921ad 100755
+index 9917d6df..bdbbad6b 100755
 --- a/app/src/main/java/neth/iecal/curbox/utils/RestrictionComparator.kt
 +++ b/app/src/main/java/neth/iecal/curbox/utils/RestrictionComparator.kt
-@@ -17,6 +17,7 @@ import neth.iecal.curbox.data.models.Settings
- import neth.iecal.curbox.data.models.SettingsChangeDelayConfig
+@@ -19,6 +19,7 @@ import neth.iecal.curbox.data.models.ScheduledNotificationsConfig
+ import neth.iecal.curbox.data.models.SipStretchConfig
  import neth.iecal.curbox.data.models.TimeInterval
  import neth.iecal.curbox.data.models.UiHiderConfig
 +import neth.iecal.curbox.data.models.UnlockGapConfig
  import neth.iecal.curbox.data.models.upgradeLegacyConfig
  import neth.iecal.curbox.hardcoded.allScripts
  
-@@ -59,12 +60,30 @@ object RestrictionComparator {
+@@ -68,12 +69,30 @@ object RestrictionComparator {
                      !current.isWebsiteUsageTrackingEnabled || proposed.isWebsiteUsageTrackingEnabled
                  GatedSettingsField.CHANGE_DELAY ->
                      changeDelay(current.settingsChangeDelayConfig2, proposed.settingsChangeDelayConfig2)
@@ -1189,7 +1189,7 @@ index 5112afc4..96f921ad 100755
      fun changeDelay(old: SettingsChangeDelayConfig, new: SettingsChangeDelayConfig): Boolean {
          // Off or set to no wait means the timer holds nothing, so any change to it passes
          val timeOk = !old.isEnabled || old.delayMinutes <= 0 ||
-@@ -320,6 +339,14 @@ object RestrictionComparator {
+@@ -354,6 +373,14 @@ object RestrictionComparator {
          val dialogHiddenOk = !o.isWarningDialogHidden || n.isWarningDialogHidden
          val proceedDelayOk = n.proceedDelayInSecs >= o.proceedDelayInSecs
          val vibrateOk = !o.vibrateAndIncBrightness || n.vibrateAndIncBrightness
@@ -1204,7 +1204,7 @@ index 5112afc4..96f921ad 100755
          val proceedLimitOk = when {
              o.proceedLimitEnabled && !n.proceedLimitEnabled -> false
              o.proceedLimitEnabled && n.proceedLimitEnabled ->
-@@ -359,7 +386,7 @@ object RestrictionComparator {
+@@ -393,7 +420,7 @@ object RestrictionComparator {
  
          return onEachOpenOk && cooldownOk && dynamicIntervalOk &&
              proceedDisabledOk && dialogHiddenOk &&
@@ -1245,10 +1245,10 @@ index 66e2d135..8bae3f32 100644
          require(settings.reelCounterOverlayConfig.textSize.isFinite() && settings.reelCounterOverlayConfig.textSize > 0f)
          require(settings.mindfulMessageConfig.positionX.isFinite() && settings.mindfulMessageConfig.positionY.isFinite())
 diff --git a/app/src/main/java/neth/iecal/curbox/utils/SettingsChangeDelayUtils.kt b/app/src/main/java/neth/iecal/curbox/utils/SettingsChangeDelayUtils.kt
-index 8256652e..674f253b 100644
+index 38220675..0e0e90b8 100644
 --- a/app/src/main/java/neth/iecal/curbox/utils/SettingsChangeDelayUtils.kt
 +++ b/app/src/main/java/neth/iecal/curbox/utils/SettingsChangeDelayUtils.kt
-@@ -63,6 +63,8 @@ object SettingsChangeDelayUtils {
+@@ -65,6 +65,8 @@ object SettingsChangeDelayUtils {
                  GatedSettingsField.UI_HIDER -> R.string.change_delay_field_ui_hider
                  GatedSettingsField.APP_USAGE_TRACKING -> R.string.app_usage_tracking
                  GatedSettingsField.WEBSITE_USAGE_TRACKING -> R.string.website_usage_tracking
@@ -1258,7 +1258,7 @@ index 8256652e..674f253b 100644
              }
          )
 diff --git a/app/src/main/res/layout/dialog_warning_overlay.xml b/app/src/main/res/layout/dialog_warning_overlay.xml
-index b3b550f9..dc124649 100644
+index f4a1024e..ac508e5d 100644
 --- a/app/src/main/res/layout/dialog_warning_overlay.xml
 +++ b/app/src/main/res/layout/dialog_warning_overlay.xml
 @@ -27,6 +27,16 @@
@@ -1278,7 +1278,7 @@ index b3b550f9..dc124649 100644
      <neth.iecal.curbox.ui.views.HorizontalNumberPicker
          android:id="@+id/mins_picker"
          android:layout_width="wrap_content"
-@@ -163,4 +173,14 @@
+@@ -163,6 +173,16 @@
          android:text="@string/cancel"
          android:textAllCaps="true" />
  
@@ -1292,12 +1292,14 @@ index b3b550f9..dc124649 100644
 +        android:visibility="gone"
 +        tools:text="Emergency unlock (1 left)" />
 +
- </LinearLayout>
+     <TextView
+         android:id="@+id/urge_surf_offer"
+         style="@style/TextAppearance.Material3.BodyMedium"
 diff --git a/app/src/main/res/layout/fragment_reducers.xml b/app/src/main/res/layout/fragment_reducers.xml
-index 967fffef..4dd6308f 100644
+index f41641d9..b1c2895b 100644
 --- a/app/src/main/res/layout/fragment_reducers.xml
 +++ b/app/src/main/res/layout/fragment_reducers.xml
-@@ -819,6 +819,69 @@
+@@ -1074,6 +1074,69 @@
              </LinearLayout>
          </com.google.android.material.card.MaterialCardView>
  
@@ -1548,10 +1550,10 @@ index 00000000..4ec94078
 +    </LinearLayout>
 +</androidx.core.widget.NestedScrollView>
 diff --git a/app/src/main/res/layout/fragment_warning_config.xml b/app/src/main/res/layout/fragment_warning_config.xml
-index 0467b186..092d28f6 100755
+index 55cb2280..90b89ace 100755
 --- a/app/src/main/res/layout/fragment_warning_config.xml
 +++ b/app/src/main/res/layout/fragment_warning_config.xml
-@@ -684,6 +684,106 @@
+@@ -700,6 +700,106 @@
                              android:valueTo="60.0" />
                      </LinearLayout>
  
@@ -1659,13 +1661,13 @@ index 0467b186..092d28f6 100755
                          android:id="@+id/switch_vibrate_brightness"
                          style="@style/TextAppearance.Material3.TitleSmall"
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index 31d32bc9..215cb831 100755
+index b659e326..2688227e 100755
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
-@@ -2008,4 +2008,39 @@
-     <string name="onboarding_finish_failed">Could not finish setup. Please try again.</string>
-     <string name="usage_select_background_art">Select background art</string>
-     <string name="usage_background_art_random">Random</string>
+@@ -1116,4 +1116,39 @@
+         <item quantity="one">%d notification waited for this time.</item>
+         <item quantity="other">%d notifications waited for this time.</item>
+     </plurals>
 +    <!-- Unlock gap and emergency unlock -->
 +    <string name="label_unlock_gap">Wait longer after each unlock</string>
 +    <string name="label_unlock_gap_desc">After an unlock ends, you must wait before you can unlock again. The wait grows with each unlock and starts over when your day ends. Example: 1, 2, 3 minutes and so on.</string>
