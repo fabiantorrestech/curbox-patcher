@@ -1,0 +1,85 @@
+From 1e50179adcb92840e1a2a404860e8765474e7676 Mon Sep 17 00:00:00 2001
+From: fab <faibiantorrestech@gmail.com>
+Date: Mon, 16 Nov 2026 01:09:51 -0600
+Subject: [PATCH] fix(app blocker): restart the blocker process after a few
+ service restarts
+
+Android keeps every ended accessibility service in memory through its
+binder wrapper (IAccessibilityServiceClientWrapper.mContext, pinned by a
+JNI global while the system holds the remote side). Each ended
+AppBlockerService keeps all of its blockers and trackers, so repeated
+restarts, such as one per UiAutomation connection (uiautomator dump),
+ran the blocker process out of memory.
+
+After three services have ended in one process, stop the process right
+after onDestroy finishes. Trackers already save synchronously there, and
+pending SharedPreferences writes are flushed before the posted stop runs.
+The next bind starts a fresh process.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../curbox/services/AppBlockerService.kt      |  1 +
+ .../curbox/services/DeadServiceRecycler.kt    | 39 +++++++++++++++++++
+ 2 files changed, 40 insertions(+)
+ create mode 100644 app/src/main/java/neth/iecal/curbox/services/DeadServiceRecycler.kt
+
+diff --git a/app/src/main/java/neth/iecal/curbox/services/AppBlockerService.kt b/app/src/main/java/neth/iecal/curbox/services/AppBlockerService.kt
+index 3da3d7aa..4cb8faaf 100644
+--- a/app/src/main/java/neth/iecal/curbox/services/AppBlockerService.kt
++++ b/app/src/main/java/neth/iecal/curbox/services/AppBlockerService.kt
+@@ -291,6 +291,7 @@ class AppBlockerService : BaseBlockingService() {
+         cleanupFeature("reel usage") { reelUsageTracker.onDestroy() }
+         cleanupFeature("website usage") { websiteUsageTracker.onDestroy() }
+         cleanupFeature("app usage") { appUsageTracker.onDestroy() }
++        DeadServiceRecycler.onServiceDestroyed()
+     }
+ 
+     private inline fun cleanupFeature(name: String, cleanup: () -> Unit) {
+diff --git a/app/src/main/java/neth/iecal/curbox/services/DeadServiceRecycler.kt b/app/src/main/java/neth/iecal/curbox/services/DeadServiceRecycler.kt
+new file mode 100644
+index 00000000..214a2b24
+--- /dev/null
++++ b/app/src/main/java/neth/iecal/curbox/services/DeadServiceRecycler.kt
+@@ -0,0 +1,39 @@
++package neth.iecal.curbox.services
++
++import android.os.Handler
++import android.os.Looper
++import android.os.Process
++import android.util.Log
++
++/**
++ * Restarts the blocker process after a few blocker services have ended in it.
++ *
++ * Android keeps every ended accessibility service in memory: its binder wrapper
++ * (AccessibilityService.IAccessibilityServiceClientWrapper) holds the service, and the system
++ * keeps that wrapper alive after unbinding. Each ended AppBlockerService keeps all of its blockers
++ * and trackers, so frequent restarts run the process out of memory. Android restarts the service
++ * every time a UiAutomation client connects (uiautomator dump, test and automation tools), so a
++ * few hundred of those crashed Curbox with an OutOfMemoryError.
++ *
++ * Only a new process frees them. Once [MAX_ENDED_SERVICES] have ended, the process stops itself
++ * right after the latest one is cleaned up. Nothing is lost: the trackers save synchronously in
++ * onDestroy, and Android writes pending SharedPreferences to disk after onDestroy returns, before
++ * the posted stop runs. When the system binds the service again it starts a fresh process.
++ *
++ * Normal use rarely restarts the service, so most processes never get here.
++ */
++internal object DeadServiceRecycler {
++
++    private const val TAG = "DeadServiceRecycler"
++    private const val MAX_ENDED_SERVICES = 3
++
++    private var endedServices = 0 // main thread only
++
++    /** Call at the end of AppBlockerService.onDestroy, on the main thread. */
++    fun onServiceDestroyed() {
++        endedServices++
++        if (endedServices < MAX_ENDED_SERVICES) return
++        Log.w(TAG, "$endedServices blocker services ended in this process; restarting it to free them")
++        Handler(Looper.getMainLooper()).post { Process.killProcess(Process.myPid()) }
++    }
++}
+-- 
+2.54.0.windows.1
+

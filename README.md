@@ -1,10 +1,11 @@
 # curbox-patcher
 
-Builds [Curbox](https://github.com/curbox-app/curbox-android) releases (fdroid flavor) with three extra patches:
+Builds [Curbox](https://github.com/curbox-app/curbox-android) releases (fdroid flavor) with four extra patches:
 
 - **Grayscale: Curbox only switches off a grayscale filter it switched on itself.** Filters that you or another app (such as GrayScaler+) turn on are left alone. With no grayscale groups, or all groups disabled, Curbox never changes the grayscale setting.
 - **Firefox: links opened from another app are checked right away.** In stock Curbox, a link opened in Firefox from a text or chat showed its first page unblocked, and the block only came on the first tap inside the page.
 - **Unlock waits: a growing wait between app unlocks, plus an emergency password.** After an app group unlock ends, the next unlock waits 1 minute, then 2, then 3 and so on (you pick the numbers per group). The waits start over at your "day end" time, set per weekday. An optional emergency password unlocks right away a few times a day.
+- **Memory: frequent blocker restarts no longer crash Curbox.** Android keeps every ended blocker service in memory, so many restarts in a row (for example from automation tools that read the screen, like `uiautomator dump`) ran Curbox out of memory. The blocker process now restarts itself after three of them.
 
 Unofficial build, not made by the Curbox developers. Supports Curbox **7 and later**. The patches are made against Curbox 7; the builds for Curbox 6 stay under Releases.
 
@@ -93,6 +94,13 @@ Only one Curbox file, `trackers/WebsiteUsageTracker.kt`, and no settings or stor
 - **Stored data:** new settings fields with defaults (old backups still load). The unlock count lives in the blocker service's own preferences, so it survives a service restart. No database change.
 - **Checked on a phone (Pixel 5, debug build):** waits of 1 then 2 minutes, countdown kept after killing the service, on each open waits start on leaving, wrong password refused, emergency unlock during a wait, day end reset, change delay holds a weaker change.
 
+### What the memory fix changes
+
+- **The bug (in Curbox 7 itself, not the other patches).** Android restarts every accessibility service each time a UiAutomation client connects (`uiautomator dump`, test and automation tools). Android's own binder wrapper keeps the ended service in memory, with all of its blockers and trackers. A few hundred restarts ran the blocker process out of memory, and Curbox's crash screen covered the screen.
+- **The fix.** New file `DeadServiceRecycler.kt`, plus one line at the end of `AppBlockerService.onDestroy`. After three services have ended in one process, the process stops itself right after the latest one is cleaned up. Android starts a fresh process the next time it binds the service.
+- **Nothing is lost.** The trackers already save synchronously in `onDestroy`, and Android writes pending preferences to disk before the stop runs. Normal use rarely restarts the service, so most processes never reach three.
+- **Checked on a phone (Pixel 5, debug build):** 20 `uiautomator dump` calls in a row. Stock Curbox 7 kept every ended service (4 contexts grew to 24, still there after a forced GC). With the fix it stayed at 4 to 6, the service came back bound each time, and no crash.
+
 ## Patching it yourself
 
 ### Usually: nothing
@@ -115,6 +123,7 @@ cd ~/Documents/Developer/repos/curbox-patcher
 scripts/refresh-patch.sh ../curbox-android 7                      # grayscale patch (the default)
 scripts/refresh-patch.sh ../curbox-android 7 firefox-url-rescan   # Firefox patch
 scripts/refresh-patch.sh ../curbox-android 7 unlock-gap           # unlock waits patch
+scripts/refresh-patch.sh ../curbox-android 7 service-leak         # memory fix
 ```
 
 `7` is the new Curbox release. Run it once for each patch that failed.
